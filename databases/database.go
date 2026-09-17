@@ -11,7 +11,6 @@ import (
 	"orbitdb/go-orbitdb/oplog"
 	"orbitdb/go-orbitdb/storage"
 	orbitsync "orbitdb/go-orbitdb/syncutils"
-	"sync"
 )
 
 // Database represents the base class for all database types.
@@ -25,7 +24,6 @@ type Database struct {
 	Events      chan interface{}
 	taskQueue   chan func()
 	stopChannel chan struct{}
-	mu          sync.Mutex
 }
 
 // NewDatabase creates a new Database instance.

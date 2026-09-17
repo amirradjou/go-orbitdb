@@ -1,10 +1,6 @@
 package providers
 
 import (
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"encoding/hex"
-	"math/big"
 	"orbitdb/go-orbitdb/keystore"
 	"orbitdb/go-orbitdb/storage"
 	"testing"
@@ -53,23 +49,17 @@ func TestCreateIdentity(t *testing.T) {
 	}
 
 	// Verify that the ID signature is valid
-	publicKeyBytes, err := hex.DecodeString(identity.PublicKey)
+	pubKey, err := keystore.ReconstructPublicKeyFromHex(identity.PublicKey)
 	if err != nil {
 		t.Fatalf("Error decoding public key: %v", err)
 	}
 
-	pubKey := ecdsa.PublicKey{
-		Curve: elliptic.P256(),
-		X:     new(big.Int).SetBytes(publicKeyBytes[:len(publicKeyBytes)/2]),
-		Y:     new(big.Int).SetBytes(publicKeyBytes[len(publicKeyBytes)/2:]),
-	}
-
-	idVerified, err := ks.VerifyMessage(pubKey, []byte(identity.ID), identity.Signatures["id"])
+	idVerified, err := ks.VerifyMessage(*pubKey, []byte(identity.ID), identity.Signatures["id"])
 	if err != nil || !idVerified {
 		t.Fatal("Expected ID signature to be valid")
 	}
 
-	publicKeyVerified, err := ks.VerifyMessage(pubKey, []byte(identity.PublicKey), identity.Signatures["publicKey"])
+	publicKeyVerified, err := ks.VerifyMessage(*pubKey, []byte(identity.PublicKey), identity.Signatures["publicKey"])
 	if err != nil || !publicKeyVerified {
 		t.Fatal("Expected public key signature to be valid")
 	}

@@ -28,6 +28,21 @@ type PrivateKeyData struct {
 	D     string `json:"d"`
 }
 
+const (
+	// CoordinateSize is the fixed byte width of a P-256 field element or
+	// scalar (X, Y, r and s). Values are always zero-padded to this width
+	// when encoded: big.Int.Bytes() strips leading zeros, which would make
+	// ~1 in 128 public keys and signatures shorter than expected and
+	// impossible to split back into their two halves.
+	CoordinateSize = 32
+
+	// PublicKeySize is the byte length of an encoded public key (X || Y).
+	PublicKeySize = 2 * CoordinateSize
+
+	// SignatureSize is the byte length of an encoded signature (r || s).
+	SignatureSize = 2 * CoordinateSize
+)
+
 // NewKeyStore initializes a new KeyStore with the provided Storage.
 func NewKeyStore(storage storage.Storage) *KeyStore {
 	return &KeyStore{
@@ -124,22 +139,61 @@ func (ks *KeyStore) SignMessage(id string, data []byte) (string, error) {
 		return "", err
 	}
 
-	signature := append(r.Bytes(), s.Bytes()...)
-	return hex.EncodeToString(signature), nil
+	return hex.EncodeToString(marshalSignature(r, s)), nil
 }
 
 // VerifyMessage verifies the signature against the data using the public key.
 func (ks *KeyStore) VerifyMessage(publicKey ecdsa.PublicKey, data []byte, signatureHex string) (bool, error) {
 	sigBytes, err := hex.DecodeString(signatureHex)
-	if err != nil || len(sigBytes) < 64 {
+	if err != nil {
 		return false, err
 	}
 
-	r := new(big.Int).SetBytes(sigBytes[:len(sigBytes)/2])
-	s := new(big.Int).SetBytes(sigBytes[len(sigBytes)/2:])
+	r, s, err := unmarshalSignature(sigBytes)
+	if err != nil {
+		return false, err
+	}
 
 	hash := sha256.Sum256(data)
 	return ecdsa.Verify(&publicKey, hash[:], r, s), nil
+}
+
+// marshalSignature encodes r and s as two fixed-width, big-endian,
+// zero-padded CoordinateSize halves (r || s).
+func marshalSignature(r, s *big.Int) []byte {
+	sig := make([]byte, SignatureSize)
+	r.FillBytes(sig[:CoordinateSize])
+	s.FillBytes(sig[CoordinateSize:])
+	return sig
+}
+
+// unmarshalSignature splits a fixed-width r || s signature back into its
+// two scalars. The length must be exactly SignatureSize.
+func unmarshalSignature(sig []byte) (r, s *big.Int, err error) {
+	if len(sig) != SignatureSize {
+		return nil, nil, fmt.Errorf("invalid signature length: %d, want %d", len(sig), SignatureSize)
+	}
+	r = new(big.Int).SetBytes(sig[:CoordinateSize])
+	s = new(big.Int).SetBytes(sig[CoordinateSize:])
+	return r, s, nil
+}
+
+// EncodePublicKey returns the hex encoding of a P-256 public key as
+// X || Y, each zero-padded to CoordinateSize bytes, so the result is always
+// PublicKeySize bytes (2*PublicKeySize hex characters) and can be parsed
+// back with ReconstructPublicKeyFromHex.
+func EncodePublicKey(publicKey *ecdsa.PublicKey) (string, error) {
+	if publicKey == nil || publicKey.X == nil || publicKey.Y == nil {
+		return "", errors.New("public key is nil")
+	}
+	if publicKey.X.Sign() < 0 || publicKey.Y.Sign() < 0 ||
+		publicKey.X.BitLen() > 8*CoordinateSize || publicKey.Y.BitLen() > 8*CoordinateSize {
+		return "", fmt.Errorf("public key coordinate does not fit in %d bytes", CoordinateSize)
+	}
+	buf := make([]byte, PublicKeySize)
+	publicKey.X.FillBytes(buf[:CoordinateSize])
+	publicKey.Y.FillBytes(buf[CoordinateSize:])
+	return hex.EncodeToString(buf), nil
 }
 
 // SerializePrivateKey serializes an ECDSA private key to a JSON-encoded byte slice.
@@ -183,16 +237,18 @@ func DeserializePrivateKey(data []byte) (*ecdsa.PrivateKey, error) {
 	}, nil
 }
 
+// ReconstructPublicKeyFromHex parses a public key produced by EncodePublicKey
+// (hex of X || Y, each exactly CoordinateSize bytes) back into an ecdsa.PublicKey.
 func ReconstructPublicKeyFromHex(pubKeyHex string) (*ecdsa.PublicKey, error) {
 	pubKeyBytes, err := hex.DecodeString(pubKeyHex)
 	if err != nil {
 		return nil, err
 	}
-	if len(pubKeyBytes) != 64 {
-		return nil, fmt.Errorf("invalid public key length: %d", len(pubKeyBytes))
+	if len(pubKeyBytes) != PublicKeySize {
+		return nil, fmt.Errorf("invalid public key length: %d, want %d", len(pubKeyBytes), PublicKeySize)
 	}
-	xBytes := pubKeyBytes[:32]
-	yBytes := pubKeyBytes[32:]
+	xBytes := pubKeyBytes[:CoordinateSize]
+	yBytes := pubKeyBytes[CoordinateSize:]
 	x := new(big.Int).SetBytes(xBytes)
 	y := new(big.Int).SetBytes(yBytes)
 	pubKey := &ecdsa.PublicKey{
