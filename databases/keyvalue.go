@@ -147,7 +147,7 @@ func (kv *KeyValue) All() (map[string]interface{}, error) {
 
 		op, ok := payload["op"].(string)
 		key, _ := payload["key"].(string)
-		value, _ := payload["value"].(interface{})
+		value := payload["value"]
 
 		// If the key has already been processed, skip it
 		if processedKeys[key] {

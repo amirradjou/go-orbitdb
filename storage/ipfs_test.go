@@ -48,41 +48,6 @@ func encodeCBORBytes(t *testing.T, data []byte) []byte {
 	return buf.Bytes()
 }
 
-// encodeCBORMap encodes a map[string]string into CBOR.
-func encodeCBORMap(t *testing.T, data map[string]string) []byte {
-	// Create a Map node builder.
-	nb := basicnode.Prototype.Map.NewBuilder()
-	mBuilder, err := nb.BeginMap(int64(len(data)))
-	require.NoError(t, err, "Failed to begin map builder")
-
-	// Iterate over the map and assign key-value pairs.
-	for k, v := range data {
-		// Assemble an entry for the key.
-		entryAssembler, err := mBuilder.AssembleEntry(k)
-		require.NoError(t, err, "Failed to assemble entry for key: "+k)
-
-		// Assign the value to the entry.
-		err = entryAssembler.AssignString(v)
-		require.NoError(t, err, "Failed to assign string value for key: "+k)
-	}
-
-	// Finish building the map.
-	err = mBuilder.Finish()
-	require.NoError(t, err, "Failed to finish map builder")
-
-	// Build the node.
-	node := nb.Build()
-
-	// Prepare a buffer to write the CBOR-encoded data.
-	var buf bytes.Buffer
-
-	// Encode the node into CBOR and write to the buffer.
-	err = dagcbor.Encode(node, &buf)
-	require.NoError(t, err, "Failed to encode map node to CBOR")
-
-	return buf.Bytes()
-}
-
 // encodeCBORComplexMap encodes a map[string]interface{} into CBOR.
 func encodeCBORComplexMap(t *testing.T, data map[string]interface{}) []byte {
 	// Create a Map node builder.

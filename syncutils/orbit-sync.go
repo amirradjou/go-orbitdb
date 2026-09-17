@@ -25,7 +25,6 @@ type Sync struct {
 	TopicName string           // PubSub topic name
 	topic     *pubsub.Topic    // Subscribed topic
 	sub       *pubsub.Subscription
-	mu        sync.Mutex      // Protects peer access
 	wg        sync.WaitGroup  // WaitGroup for goroutines
 	peerMap   map[string]bool // Tracks connected peers
 }
