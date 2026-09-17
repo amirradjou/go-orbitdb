@@ -1,11 +1,8 @@
 package providers
 
 import (
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"encoding/hex"
 	"errors"
-	"math/big"
+	"fmt"
 	"orbitdb/go-orbitdb/identities/identitytypes"
 	"orbitdb/go-orbitdb/keystore"
 )
@@ -40,8 +37,11 @@ func (p *PublicKeyProvider) CreateIdentity(id string) (*identitytypes.Identity, 
 		return nil, err
 	}
 
-	// Generate the public key as a hex-encoded string
-	publicKey := hex.EncodeToString(append(privateKey.PublicKey.X.Bytes(), privateKey.PublicKey.Y.Bytes()...))
+	// Encode the public key as fixed-width hex (X || Y, 32 bytes each).
+	publicKey, err := keystore.EncodePublicKey(&privateKey.PublicKey)
+	if err != nil {
+		return nil, err
+	}
 
 	// Sign the ID and public key
 	idSignature, err := p.keystore.SignMessage(id, []byte(id))
@@ -84,27 +84,20 @@ func (p *PublicKeyProvider) VerifyIdentity(identity *identitytypes.Identity) (bo
 		return false, errors.New("identity is missing required fields")
 	}
 
-	// Decode the public key from the hex-encoded string
-	publicKeyBytes, err := hex.DecodeString(identity.PublicKey)
-	if err != nil || len(publicKeyBytes) < 64 {
-		return false, errors.New("invalid public key encoding")
-	}
-
-	// Reconstruct the ecdsa.PublicKey
-	pubKey := ecdsa.PublicKey{
-		Curve: elliptic.P256(),
-		X:     new(big.Int).SetBytes(publicKeyBytes[:len(publicKeyBytes)/2]),
-		Y:     new(big.Int).SetBytes(publicKeyBytes[len(publicKeyBytes)/2:]),
+	// Reconstruct the ecdsa.PublicKey from the fixed-width hex encoding
+	pubKey, err := keystore.ReconstructPublicKeyFromHex(identity.PublicKey)
+	if err != nil {
+		return false, fmt.Errorf("invalid public key encoding: %w", err)
 	}
 
 	// Verify the ID signature using the KeyStore's VerifyMessage method
-	idVerified, err := p.keystore.VerifyMessage(pubKey, []byte(identity.ID), identity.Signatures["id"])
+	idVerified, err := p.keystore.VerifyMessage(*pubKey, []byte(identity.ID), identity.Signatures["id"])
 	if err != nil || !idVerified {
 		return false, errors.New("invalid ID signature")
 	}
 
 	// Verify the public key signature using the KeyStore's VerifyMessage method
-	publicKeyVerified, err := p.keystore.VerifyMessage(pubKey, []byte(identity.PublicKey), identity.Signatures["publicKey"])
+	publicKeyVerified, err := p.keystore.VerifyMessage(*pubKey, []byte(identity.PublicKey), identity.Signatures["publicKey"])
 	if err != nil || !publicKeyVerified {
 		return false, errors.New("invalid public key signature")
 	}

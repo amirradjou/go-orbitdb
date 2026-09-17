@@ -2,10 +2,7 @@ package identities
 
 import (
 	"crypto/ecdsa"
-	"crypto/elliptic"
-	"encoding/hex"
 	"errors"
-	"math/big"
 	"orbitdb/go-orbitdb/identities/identitytypes"
 	"orbitdb/go-orbitdb/identities/providers"
 	"orbitdb/go-orbitdb/keystore"
@@ -84,21 +81,14 @@ func (ids *Identities) Sign(id string, data []byte) (string, error) {
 
 // Verify verifies the provided signature against the data and public key.
 func (ids *Identities) Verify(signature string, identity *identitytypes.Identity, data []byte) bool {
-	// Decode the public key from the identity's hex-encoded string
-	publicKeyBytes, err := hex.DecodeString(identity.PublicKey)
-	if err != nil || len(publicKeyBytes) < 64 {
+	// Reconstruct the ecdsa.PublicKey from the identity's fixed-width hex encoding
+	pubKey, err := keystore.ReconstructPublicKeyFromHex(identity.PublicKey)
+	if err != nil {
 		return false
 	}
 
-	// Reconstruct the ecdsa.PublicKey from the byte slice
-	pubKey := ecdsa.PublicKey{
-		Curve: elliptic.P256(),
-		X:     new(big.Int).SetBytes(publicKeyBytes[:len(publicKeyBytes)/2]),
-		Y:     new(big.Int).SetBytes(publicKeyBytes[len(publicKeyBytes)/2:]),
-	}
-
 	// Use VerifyMessage from KeyStore to verify the signature
-	verified, err := ids.keystore.VerifyMessage(pubKey, data, signature)
+	verified, err := ids.keystore.VerifyMessage(*pubKey, data, signature)
 	return err == nil && verified
 }
 

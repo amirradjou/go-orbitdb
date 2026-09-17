@@ -16,8 +16,11 @@ func createTestIdentity(id string, identityType string) (*Identity, error) {
 		return nil, err
 	}
 
-	// Encode the public key as a hex string
-	publicKeyBytes := append(privateKey.PublicKey.X.Bytes(), privateKey.PublicKey.Y.Bytes()...)
+	// Encode the public key as fixed-width hex (X || Y, 32 bytes each; Bytes()
+	// would drop leading zeros and occasionally yield a 63-byte key)
+	publicKeyBytes := make([]byte, 64)
+	privateKey.PublicKey.X.FillBytes(publicKeyBytes[:32])
+	privateKey.PublicKey.Y.FillBytes(publicKeyBytes[32:])
 	publicKeyHex := hex.EncodeToString(publicKeyBytes)
 
 	// Create the Identity object without PrivateKey
