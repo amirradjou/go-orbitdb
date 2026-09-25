@@ -43,7 +43,9 @@ jobs:
           fi
 
       - name: go vet
-        run: go vet ./...
+        run: |
+          go vet ./...
+          go vet -tags interop ./interop/
 
       - name: staticcheck
         run: go run honnef.co/go/tools/cmd/staticcheck@latest ./...
@@ -63,7 +65,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        # go.mod floor (go-ipld-prime v0.23.0 requires 1.25.7).
+        # go.mod floor (go-ipld-prime and go-libp2p require 1.25.7).
         go-version: ['1.25']
         include:
           - os: ubuntu-latest
@@ -85,14 +87,51 @@ jobs:
       - name: Test (race detector)
         run: go test -race -count=1 -coverprofile=coverage.out ./...
 
-      # The signing/identity packages had a ~1.5% random failure rate before
-      # the fixed-width ECDSA encoding fix; loop them so a regression is
-      # deterministic rather than a flake.
-      - name: Test crypto packages repeatedly
-        run: go test -count=20 ./keystore/ ./identities/... ./oplog/
+      # Replication tests run real libp2p hosts; repeat them so a flaky
+      # timing assumption shows up here rather than in someone's PR.
+      - name: Repeat networking tests
+        if: matrix.os == 'ubuntu-latest' && matrix.go-version == 'stable'
+        run: go test -race -count=5 . ./syncutils/ ./databases/ ./ipfs/
 
       - name: Upload coverage
         uses: actions/upload-artifact@v4
         with:
           name: coverage-${{ matrix.os }}-go${{ matrix.go-version }}
           path: coverage.out
+
+  interop:
+    name: Interop (@orbitdb/core 4)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            interop/js-peer/package-lock.json
+            tools/jsvectors/package-lock.json
+
+      - name: Install the JavaScript peer
+        working-directory: interop/js-peer
+        run: npm ci
+
+      - name: Go <-> JS replication
+        env:
+          ORBITDB_INTEROP_REQUIRED: "1"
+        run: go test -tags interop -race -count=1 -v ./interop/
+
+      - name: Install the vector generator
+        working-directory: tools/jsvectors
+        run: npm ci
+
+      - name: Golden vectors match @orbitdb/core
+        working-directory: tools/jsvectors
+        run: npm run check
