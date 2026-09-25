@@ -5,6 +5,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/peerstore"
+	"strings"
 	"testing"
 	"time"
 
@@ -19,6 +20,34 @@ import (
 	"orbitdb/go-orbitdb/storage"
 	"orbitdb/go-orbitdb/syncutils"
 )
+
+// newTestGossipSub enables flood publishing. Without it a node that has joined
+// a topic publishes only to its mesh, which stays empty until the first
+// heartbeat grafts the peer (~1s), so a message sent right after discovery can
+// reach nobody.
+func newTestGossipSub(ctx context.Context, h host.Host) (*pubsub.PubSub, error) {
+	return pubsub.NewGossipSub(ctx, h, pubsub.WithFloodPublish(true))
+}
+
+// awaitSynced returns the first entry on ch whose payload contains want.
+// trackPeers publishes its own peer-join events on SyncedCh at an unspecified
+// point after discovery, so a test cannot assume the next entry is the one it
+// triggered.
+func awaitSynced(t *testing.T, ch <-chan syncutils.SyncedEntry, want string) syncutils.SyncedEntry {
+	t.Helper()
+	timeout := time.After(2 * time.Second)
+	for {
+		select {
+		case synced := <-ch:
+			if strings.Contains(synced.Entry.Payload, want) {
+				return synced
+			}
+			t.Logf("skipping unrelated synced entry: %q", synced.Entry.Payload)
+		case <-timeout:
+			t.Fatalf("Timeout waiting for synced entry containing %q", want)
+		}
+	}
+}
 
 // setupTestKeyStoreAndIdentity initializes a keystore and identity for testing.
 func setupTestKeyStoreAndIdentity(t *testing.T, identityID string) (*keystore.KeyStore, *identitytypes.Identity) {
@@ -68,7 +97,7 @@ func TestSyncStartStop(t *testing.T) {
 		}
 	}(host1)
 
-	ps, err := pubsub.NewGossipSub(ctx, host1)
+	ps, err := newTestGossipSub(ctx, host1)
 	require.NoError(t, err, "Failed to create GossipSub instance")
 
 	log := createMockLog(t, "test-log", "test-identity")
@@ -95,7 +124,7 @@ func TestSyncAddAndBroadcast(t *testing.T) {
 		}
 	}(host1)
 
-	ps, err := pubsub.NewGossipSub(ctx, host1)
+	ps, err := newTestGossipSub(ctx, host1)
 	require.NoError(t, err, "Failed to create GossipSub instance")
 
 	log := createMockLog(t, "test-log", "test-identity")
@@ -153,9 +182,9 @@ func TestSyncReceiveFromPeer(t *testing.T) {
 	require.NoError(t, err, "Failed to connect hostPeer to hostSelf")
 
 	// Create GossipSub instances for each host
-	psSelf, err := pubsub.NewGossipSub(ctx, hostSelf)
+	psSelf, err := newTestGossipSub(ctx, hostSelf)
 	require.NoError(t, err, "Failed to create GossipSub for self")
-	psPeer, err := pubsub.NewGossipSub(ctx, hostPeer)
+	psPeer, err := newTestGossipSub(ctx, hostPeer)
 	require.NoError(t, err, "Failed to create GossipSub for peer")
 
 	// Create logs and Sync instances
@@ -207,13 +236,9 @@ PeerDiscoveryComplete:
 	assert.NoError(t, err, "Failed to add entry to syncPeer")
 
 	// Verify the message is received by syncSelf
-	select {
-	case synced := <-syncSelf.SyncedCh:
-		assert.Equal(t, "peer-entry", synced.Entry.Payload, "Received entry payload mismatch")
-		assert.Equal(t, hostPeer.ID().String(), synced.PeerID, "Received PeerID mismatch")
-	case <-time.After(1 * time.Second): // Allow more time for PubSub propagation
-		t.Fatal("Timeout waiting for synced message from peer")
-	}
+	synced := awaitSynced(t, syncSelf.SyncedCh, "peer-entry")
+	assert.Equal(t, "peer-entry", synced.Entry.Payload, "Received entry payload mismatch")
+	assert.Equal(t, hostPeer.ID().String(), synced.PeerID, "Received PeerID mismatch")
 
 	syncSelf.Stop()
 	syncPeer.Stop()
@@ -251,9 +276,9 @@ func TestSyncPeerJoinLeave(t *testing.T) {
 	require.NoError(t, err, "Failed to connect hostPeer to hostSelf")
 
 	// Create GossipSub instances for each host
-	psSelf, err := pubsub.NewGossipSub(ctx, hostSelf)
+	psSelf, err := newTestGossipSub(ctx, hostSelf)
 	require.NoError(t, err, "Failed to create GossipSub for self")
-	psPeer, err := pubsub.NewGossipSub(ctx, hostPeer)
+	psPeer, err := newTestGossipSub(ctx, hostPeer)
 	require.NoError(t, err, "Failed to create GossipSub for peer")
 
 	// Create logs and Sync instances
@@ -317,14 +342,10 @@ PeerDiscoveryComplete:
 	peerID2 := hostPeer.ID().String()
 	syncSelf.PeerLeave(peerID2)
 
-	// Verify the "leave" event is received by syncSelf
-	select {
-	case synced := <-syncSelf.SyncedCh:
-		assert.Contains(t, synced.Entry.Payload, "has left the network", "Leave payload mismatch")
-		assert.Equal(t, peerID2, synced.PeerID, "PeerID mismatch in leave event")
-	case <-time.After(1 * time.Second):
-		t.Fatal("Timeout waiting for PeerLeave message")
-	}
+	// Verify the "leave" event is received by syncSelf (skipping the join
+	// event trackPeers may also have emitted)
+	synced := awaitSynced(t, syncSelf.SyncedCh, "has left the network")
+	assert.Equal(t, peerID2, synced.PeerID, "PeerID mismatch in leave event")
 
 	// Stop Sync instances
 	syncSelf.Stop()
@@ -363,9 +384,9 @@ func TestSyncSendAndReceiveHead(t *testing.T) {
 	require.NoError(t, err, "Failed to connect hostPeer to hostSelf")
 
 	// Create GossipSub instances for each host
-	psSelf, err := pubsub.NewGossipSub(ctx, hostSelf)
+	psSelf, err := newTestGossipSub(ctx, hostSelf)
 	require.NoError(t, err, "Failed to create GossipSub for self")
-	psPeer, err := pubsub.NewGossipSub(ctx, hostPeer)
+	psPeer, err := newTestGossipSub(ctx, hostPeer)
 	require.NoError(t, err, "Failed to create GossipSub for peer")
 
 	// Create logs and Sync instances
@@ -417,26 +438,18 @@ PeerDiscoveryComplete:
 	assert.NoError(t, err, "Failed to add entry to syncSelf")
 
 	// Verify the head is received by peer
-	select {
-	case synced := <-syncPeer.SyncedCh:
-		assert.Equal(t, "test-head-entry", synced.Entry.Payload, "Received head entry payload mismatch")
-		assert.Equal(t, hostSelf.ID().String(), synced.PeerID, "Received PeerID mismatch for head entry")
-	case <-time.After(1 * time.Second):
-		t.Fatal("Timeout waiting for head message from self")
-	}
+	synced := awaitSynced(t, syncPeer.SyncedCh, "test-head-entry")
+	assert.Equal(t, "test-head-entry", synced.Entry.Payload, "Received head entry payload mismatch")
+	assert.Equal(t, hostSelf.ID().String(), synced.PeerID, "Received PeerID mismatch for head entry")
 
 	// Peer sends a head to the self
 	err = syncPeer.Add("peer-head-entry")
 	assert.NoError(t, err, "Failed to add entry to syncPeer")
 
 	// Verify the head is received by self
-	select {
-	case synced := <-syncSelf.SyncedCh:
-		assert.Equal(t, "peer-head-entry", synced.Entry.Payload, "Received head entry payload mismatch")
-		assert.Equal(t, hostPeer.ID().String(), synced.PeerID, "Received PeerID mismatch for head entry")
-	case <-time.After(1 * time.Second):
-		t.Fatal("Timeout waiting for head message from peer")
-	}
+	synced = awaitSynced(t, syncSelf.SyncedCh, "peer-head-entry")
+	assert.Equal(t, "peer-head-entry", synced.Entry.Payload, "Received head entry payload mismatch")
+	assert.Equal(t, hostPeer.ID().String(), synced.PeerID, "Received PeerID mismatch for head entry")
 
 	// Stop Sync instances
 	syncSelf.Stop()
