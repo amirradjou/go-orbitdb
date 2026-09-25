@@ -11,3 +11,12 @@ updates:
     directory: /
     schedule:
       interval: weekly
+  # The interop peer tracks @orbitdb/core so a JS release that changes the
+  # wire format fails the interop job instead of surprising users.
+  - package-ecosystem: npm
+    directory: /interop/js-peer
+    schedule:
+      interval: weekly
+    groups:
+      js-peer:
+        patterns: ["*"]
