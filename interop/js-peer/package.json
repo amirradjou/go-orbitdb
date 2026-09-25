@@ -1,0 +1,22 @@
+{
+  "name": "go-orbitdb-interop-js-peer",
+  "private": true,
+  "description": "A JavaScript OrbitDB peer the Go interop tests drive over stdin/stdout.",
+  "type": "module",
+  "main": "peer.mjs",
+  "dependencies": {
+    "@chainsafe/libp2p-noise": "^17.0.0",
+    "@chainsafe/libp2p-yamux": "^8.0.1",
+    "@helia/block-brokers": "^5.2.4",
+    "@libp2p/gossipsub": "^17.1.2",
+    "@libp2p/identify": "^4.1.14",
+    "@libp2p/tcp": "^11.0.28",
+    "@multiformats/multiaddr": "^13.0.3",
+    "@orbitdb/core": "4.0.0",
+    "@orbitdb/simple-encryption": "0.0.2",
+    "blockstore-core": "^7.0.1",
+    "helia": "^6.1.4",
+    "it-drain": "^3.0.12",
+    "libp2p": "^3.3.11"
+  }
+}
