@@ -20,3 +20,8 @@ updates:
     groups:
       js-peer:
         patterns: ["*"]
+    ignore:
+      # @orbitdb/core 4 is built against Helia 6; with Helia 7 createOrbitDB
+      # fails with NotStartedError. Move with @orbitdb/core, not ahead of it.
+      - dependency-name: helia
+        update-types: ["version-update:semver-major"]
