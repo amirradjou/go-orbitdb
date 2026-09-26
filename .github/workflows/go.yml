@@ -65,8 +65,8 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        # go.mod floor (go-ipld-prime and go-libp2p require 1.25.7).
-        go-version: ['1.25']
+        # go.mod floor (boxo and go-libp2p require Go 1.26).
+        go-version: ['1.26']
         include:
           - os: ubuntu-latest
             go-version: stable
