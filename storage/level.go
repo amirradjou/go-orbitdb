@@ -1,91 +1,115 @@
 package storage
 
 import (
+	"context"
 	"errors"
+	"fmt"
+	"iter"
+
 	"github.com/syndtr/goleveldb/leveldb"
-	"github.com/syndtr/goleveldb/leveldb/opt"
 	"github.com/syndtr/goleveldb/leveldb/util"
 )
 
-// LevelStorage implements the Storage interface using LevelDB.
+// DefaultLevelPath is the directory used when NewLevelStorage is given "".
+const DefaultLevelPath = "./level"
+
+// LevelStorage persists pairs in a LevelDB database on disk. The on-disk
+// format is plain LevelDB, so a keystore written by the JavaScript
+// implementation can be opened directly.
 type LevelStorage struct {
 	db *leveldb.DB
 }
 
-// NewLevelStorage initializes a LevelStorage instance with the specified path.
+// NewLevelStorage opens (creating if needed) the LevelDB database at path.
 func NewLevelStorage(path string) (*LevelStorage, error) {
-	db, err := leveldb.OpenFile(path, &opt.Options{})
+	if path == "" {
+		path = DefaultLevelPath
+	}
+	db, err := leveldb.OpenFile(path, nil)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("open level storage %q: %w", path, err)
 	}
 	return &LevelStorage{db: db}, nil
 }
 
-// Put stores a key-value pair in LevelDB.
-func (s *LevelStorage) Put(key string, value []byte) error {
+// Put implements Storage.
+func (s *LevelStorage) Put(_ context.Context, key string, value []byte) error {
 	return s.db.Put([]byte(key), value, nil)
 }
 
-// Get retrieves a value by its key from LevelDB.
-func (s *LevelStorage) Get(key string) ([]byte, error) {
+// Get implements Storage.
+func (s *LevelStorage) Get(_ context.Context, key string) ([]byte, error) {
 	value, err := s.db.Get([]byte(key), nil)
-	if err == leveldb.ErrNotFound {
-		return nil, errors.New("key not found")
+	if errors.Is(err, leveldb.ErrNotFound) {
+		return nil, fmt.Errorf("%w: %s", ErrNotFound, key)
 	}
 	return value, err
 }
 
-// Delete removes a key-value pair from LevelDB.
-func (s *LevelStorage) Delete(key string) error {
+// Del implements Storage.
+func (s *LevelStorage) Del(_ context.Context, key string) error {
 	return s.db.Delete([]byte(key), nil)
 }
 
-// Iterator returns a channel that yields key-value pairs.
-func (s *LevelStorage) Iterator() (<-chan [2]string, error) {
-	iter := s.db.NewIterator(&util.Range{}, nil)
-	ch := make(chan [2]string)
+// Iterator implements Storage. Pairs are yielded in key order, or descending
+// key order when opts.Reverse is set.
+func (s *LevelStorage) Iterator(_ context.Context, opts IteratorOptions) iter.Seq2[Pair, error] {
+	return func(yield func(Pair, error) bool) {
+		it := s.db.NewIterator(&util.Range{}, nil)
+		defer it.Release()
 
-	go func() {
-		defer iter.Release()
-		defer close(ch)
-
-		for iter.Next() {
-			key := string(iter.Key())
-			value := string(iter.Value())
-			ch <- [2]string{key, value}
+		first, next := it.First, it.Next
+		if opts.Reverse {
+			first, next = it.Last, it.Prev
 		}
-	}()
-
-	return ch, nil
+		yielded := 0
+		for ok := first(); ok; ok = next() {
+			if opts.Amount > 0 && yielded >= opts.Amount {
+				return
+			}
+			// The iterator reuses its buffers, so copy before handing out.
+			p := Pair{Key: string(it.Key()), Value: append([]byte(nil), it.Value()...)}
+			yielded++
+			if !yield(p, nil) {
+				return
+			}
+		}
+		if err := it.Error(); err != nil {
+			yield(Pair{}, err)
+		}
+	}
 }
 
-// Merge merges data from another storage instance.
-func (s *LevelStorage) Merge(other Storage) error {
-	iter, err := other.Iterator()
-	if err != nil {
+// Merge implements Storage.
+func (s *LevelStorage) Merge(ctx context.Context, other Storage) error {
+	if other == nil {
+		return nil
+	}
+	batch := new(leveldb.Batch)
+	for p, err := range other.Iterator(ctx, IteratorOptions{}) {
+		if err != nil {
+			return err
+		}
+		batch.Put([]byte(p.Key), p.Value)
+	}
+	return s.db.Write(batch, nil)
+}
+
+// Clear implements Storage.
+func (s *LevelStorage) Clear(context.Context) error {
+	it := s.db.NewIterator(&util.Range{}, nil)
+	defer it.Release()
+	batch := new(leveldb.Batch)
+	for it.Next() {
+		batch.Delete(append([]byte(nil), it.Key()...))
+	}
+	if err := it.Error(); err != nil {
 		return err
 	}
-
-	batch := new(leveldb.Batch)
-	for kv := range iter {
-		batch.Put([]byte(kv[0]), []byte(kv[1]))
-	}
 	return s.db.Write(batch, nil)
 }
 
-// Clear removes all key-value pairs from LevelDB.
-func (s *LevelStorage) Clear() error {
-	iter := s.db.NewIterator(&util.Range{}, nil)
-	defer iter.Release()
-
-	batch := new(leveldb.Batch)
-	for iter.Next() {
-		batch.Delete(iter.Key())
-	}
-	return s.db.Write(batch, nil)
-}
-
-// Close closes the LevelDB instance.
+// Close implements Storage.
 func (s *LevelStorage) Close() error {
 	return s.db.Close()
 }

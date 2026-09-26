@@ -1,0 +1,16 @@
+{
+  "name": "go-orbitdb-jsvectors",
+  "private": true,
+  "description": "Generates the JavaScript golden vectors go-orbitdb's tests compare against.",
+  "type": "module",
+  "scripts": {
+    "generate": "node generate.mjs ../../internal/testutil/testdata/js-vectors.json",
+    "check": "node check.mjs"
+  },
+  "dependencies": {
+    "@libp2p/crypto": "5.1.23",
+    "@orbitdb/core": "4.0.0",
+    "@orbitdb/simple-encryption": "0.0.2",
+    "it-drain": "^3.0.12"
+  }
+}

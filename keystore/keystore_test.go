@@ -1,304 +1,234 @@
-package keystore
+package keystore_test
 
 import (
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
-	"encoding/json"
-	"orbitdb/go-orbitdb/storage"
+	"context"
+	"encoding/hex"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
 	"testing"
+
+	"github.com/libp2p/go-libp2p/core/crypto"
+	"github.com/stretchr/testify/require"
+
+	"github.com/orbitdb/go-orbitdb/internal/testutil"
+	"github.com/orbitdb/go-orbitdb/keystore"
+	"github.com/orbitdb/go-orbitdb/storage"
 )
 
-func newTestKeyStore(t *testing.T) *KeyStore {
-	// Use an LRUStorage backend for testing.
-	lruStorage, err := storage.NewLRUStorage(100)
-	if err != nil {
-		t.Fatalf("Failed to create LRU storage: %v", err)
-	}
-	return NewKeyStore(lruStorage)
+// Expected values are the ones asserted by test/key-store.test.js in
+// @orbitdb/core 4.0.0 against the same fixture keys.
+const (
+	userAPublicKey = "02e7247a4c155b63d182a23c70cb6fe8ba2e44bc9e9d62dc45d4c4167ccde95944"
+	userASignature = "3045022100df961fa46bb8a3cb92594a24205e6008a84daa563ac3530f583bb9f9cef5af3b02207b84c5d63387d0a710e42e05785fbccdaf2534c8ed16adb8afd57c3eba930529"
+)
+
+func newMemoryKeystore(t *testing.T) *keystore.KeyStore {
+	t.Helper()
+	ks, err := keystore.New(keystore.Options{Storage: storage.NewMemoryStorage()})
+	require.NoError(t, err)
+	return ks
 }
 
-func TestNewKeyStore(t *testing.T) {
-	ks := newTestKeyStore(t)
-	if ks == nil {
-		t.Fatal("Expected KeyStore instance, got nil")
+func TestCreateHasGetKey(t *testing.T) {
+	ctx := context.Background()
+	ks := newMemoryKeystore(t)
+
+	has, err := ks.HasKey(ctx, "X")
+	require.NoError(t, err)
+	require.False(t, has)
+
+	created, err := ks.CreateKey(ctx, "X")
+	require.NoError(t, err)
+	require.EqualValues(t, crypto.Secp256k1, created.Type())
+
+	has, err = ks.HasKey(ctx, "X")
+	require.NoError(t, err)
+	require.True(t, has)
+
+	got, err := ks.GetKey(ctx, "X")
+	require.NoError(t, err)
+	require.True(t, created.Equals(got))
+
+	_, err = ks.GetKey(ctx, "missing")
+	require.ErrorIs(t, err, keystore.ErrNotFound)
+
+	again, err := ks.GetOrCreateKey(ctx, "X")
+	require.NoError(t, err)
+	require.True(t, created.Equals(again), "GetOrCreateKey returns the existing key")
+}
+
+func TestEmptyIDIsRejected(t *testing.T) {
+	ctx := context.Background()
+	ks := newMemoryKeystore(t)
+	_, err := ks.CreateKey(ctx, "")
+	require.ErrorContains(t, err, "id needed to create a key")
+	_, err = ks.GetKey(ctx, "")
+	require.ErrorContains(t, err, "id needed to get a key")
+	_, err = ks.HasKey(ctx, "")
+	require.ErrorContains(t, err, "id needed to check a key")
+}
+
+func TestKeysAreStoredRaw(t *testing.T) {
+	ctx := context.Background()
+	st := storage.NewMemoryStorage()
+	ks, err := keystore.New(keystore.Options{Storage: st})
+	require.NoError(t, err)
+	key, err := ks.CreateKey(ctx, "id")
+	require.NoError(t, err)
+
+	raw, err := st.Get(ctx, "private_id")
+	require.NoError(t, err)
+	require.Len(t, raw, 32, "secp256k1 keys are stored as their 32 raw bytes, like @orbitdb/core")
+	want, err := key.Raw()
+	require.NoError(t, err)
+	require.Equal(t, want, raw)
+
+	// A fresh keystore over the same storage reads the key back.
+	ks2, err := keystore.New(keystore.Options{Storage: st})
+	require.NoError(t, err)
+	got, err := ks2.GetKey(ctx, "id")
+	require.NoError(t, err)
+	require.True(t, key.Equals(got))
+}
+
+func TestDefaultStorageUsesPath(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	ks, err := keystore.New(keystore.Options{Path: dir})
+	require.NoError(t, err)
+	key, err := ks.CreateKey(ctx, "persisted")
+	require.NoError(t, err)
+	require.NoError(t, ks.Close())
+
+	ks, err = keystore.New(keystore.Options{Path: dir})
+	require.NoError(t, err)
+	defer ks.Close()
+	got, err := ks.GetKey(ctx, "persisted")
+	require.NoError(t, err)
+	require.True(t, key.Equals(got))
+}
+
+// copyDir copies the read-only fixture so LevelDB can open it for writing.
+func copyDir(t *testing.T, src string) string {
+	t.Helper()
+	dst := t.TempDir()
+	entries, err := os.ReadDir(src)
+	require.NoError(t, err)
+	for _, e := range entries {
+		in, err := os.Open(filepath.Join(src, e.Name()))
+		require.NoError(t, err)
+		out, err := os.Create(filepath.Join(dst, e.Name()))
+		require.NoError(t, err)
+		_, err = io.Copy(out, in)
+		require.NoError(t, err)
+		require.NoError(t, in.Close())
+		require.NoError(t, out.Close())
+	}
+	return dst
+}
+
+func TestOpensJavaScriptKeystore(t *testing.T) {
+	// testdata/jskeystore is test/fixtures/newtestkeys2 from @orbitdb/core,
+	// a LevelDB database written by the JavaScript implementation.
+	ks, err := keystore.New(keystore.Options{Path: copyDir(t, "testdata/jskeystore")})
+	require.NoError(t, err)
+	defer ks.Close()
+
+	for id, want := range testutil.JSKeys {
+		key, err := ks.GetKey(context.Background(), id)
+		require.NoError(t, err, id)
+		raw, err := key.Raw()
+		require.NoError(t, err)
+		require.Equal(t, want, hex.EncodeToString(raw), id)
 	}
 }
 
-func TestCreateKey(t *testing.T) {
-	ks := newTestKeyStore(t)
-	id := "test-id"
+func TestSignMatchesJavaScript(t *testing.T) {
+	ctx := context.Background()
+	ks := testutil.Keystore(t)
+	key, err := ks.GetKey(ctx, "userA")
+	require.NoError(t, err)
 
-	_, err := ks.CreateKey(id)
-	if err != nil {
-		t.Fatalf("Expected no error, got %v", err)
-	}
+	pub, err := keystore.PublicKey(key)
+	require.NoError(t, err)
+	require.Equal(t, userAPublicKey, pub)
 
-	// Attempt to create a key with the same ID again
-	_, err = ks.CreateKey(id)
-	if err == nil {
-		t.Fatal("Expected error when creating duplicate key, got nil")
-	}
+	sig, err := keystore.SignMessage(key, []byte("data data data"))
+	require.NoError(t, err)
+	require.Equal(t, userASignature, sig, "signatures are deterministic and byte-identical to JS")
+
+	require.True(t, keystore.VerifyMessage(sig, pub, []byte("data data data")))
 }
 
-func TestHasKey(t *testing.T) {
-	ks := newTestKeyStore(t)
-	id := "test-id"
-
-	if ks.HasKey(id) {
-		t.Fatal("Expected HasKey to return false for nonexistent key")
-	}
-
-	_, err := ks.CreateKey(id)
-	if err != nil {
-		t.Fatalf("Expected no error, got %v", err)
-	}
-
-	if !ks.HasKey(id) {
-		t.Fatal("Expected HasKey to return true for existing key")
-	}
-}
-
-func TestAddKey(t *testing.T) {
-	ks := newTestKeyStore(t)
-	id := "test-id"
-
-	// Generate a new ECDSA key pair
-	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatalf("Error generating test private key: %v", err)
-	}
-
-	// Add the key to the KeyStore
-	err = ks.AddKey(id, privateKey)
-	if err != nil {
-		t.Fatalf("Expected no error adding key, got %v", err)
-	}
-
-	// Attempt to add the same key again
-	err = ks.AddKey(id, privateKey)
-	if err == nil {
-		t.Fatal("Expected error when adding duplicate key, got nil")
-	}
-}
-
-func TestClear(t *testing.T) {
-	ks := newTestKeyStore(t)
-	id := "test-id"
-
-	_, err := ks.CreateKey(id)
-	if err != nil {
-		t.Fatalf("Expected no error, got %v", err)
-	}
-
-	// Clear all keys
-	err = ks.Clear()
-	if err != nil {
-		t.Fatalf("Expected no error clearing KeyStore, got %v", err)
-	}
-
-	if ks.HasKey(id) {
-		t.Fatal("Expected HasKey to return false after clearing KeyStore")
-	}
-}
-
-func TestGetKey(t *testing.T) {
-	ks := newTestKeyStore(t)
-	id := "test-id"
-
-	// Create a new key
-	privateKey, err := ks.CreateKey(id)
-	if err != nil {
-		t.Fatalf("Expected no error, got %v", err)
-	}
-
-	// Retrieve the key
-	retrievedKey, err := ks.GetKey(id)
-	if err != nil {
-		t.Fatalf("Expected no error, got %v", err)
-	}
-
-	// Serialize and compare keys
-	origBytes, _ := json.Marshal(privateKey)
-	retrievedBytes, _ := json.Marshal(retrievedKey)
-	if string(origBytes) != string(retrievedBytes) {
-		t.Fatal("Expected retrieved key to match the original key")
-	}
-
-	// Attempt to retrieve a non-existent key
-	_, err = ks.GetKey("nonexistent-id")
-	if err == nil {
-		t.Fatal("Expected error for non-existent key, got nil")
-	}
-}
-
-func TestSignMessage(t *testing.T) {
-	ks := newTestKeyStore(t)
-	id := "test-id"
-	data := []byte("test-data")
-
-	// Create a new key and sign a message
-	_, err := ks.CreateKey(id)
-	if err != nil {
-		t.Fatalf("Expected no error, got %v", err)
-	}
-
-	signature, err := ks.SignMessage(id, data)
-	if err != nil {
-		t.Fatalf("Expected no error signing message, got %v", err)
-	}
-
-	if len(signature) == 0 {
-		t.Fatal("Expected non-empty signature")
-	}
-
-	// Attempt to sign with a non-existent key
-	_, err = ks.SignMessage("nonexistent-id", data)
-	if err == nil {
-		t.Fatal("Expected error when signing with non-existent key, got nil")
-	}
+func TestSignMessageErrors(t *testing.T) {
+	_, err := keystore.SignMessage(nil, []byte("x"))
+	require.ErrorContains(t, err, "no signing key")
+	key, _, err := crypto.GenerateSecp256k1Key(nil)
+	require.NoError(t, err)
+	_, err = keystore.SignMessage(key, nil)
+	require.ErrorContains(t, err, "input data")
 }
 
 func TestVerifyMessage(t *testing.T) {
-	ks := newTestKeyStore(t)
-	id := "test-id"
-	data := []byte("test-data")
+	key, _, err := crypto.GenerateSecp256k1Key(nil)
+	require.NoError(t, err)
+	pub, err := keystore.PublicKey(key)
+	require.NoError(t, err)
+	data := []byte("data data data")
+	sig, err := keystore.SignMessage(key, data)
+	require.NoError(t, err)
 
-	// Create a new key and sign a message
-	privateKey, err := ks.CreateKey(id)
-	if err != nil {
-		t.Fatalf("Expected no error, got %v", err)
-	}
+	require.True(t, keystore.VerifyMessage(sig, pub, data))
+	require.True(t, keystore.VerifyMessage(sig, pub, data), "cached result")
 
-	signature, err := ks.SignMessage(id, data)
-	if err != nil {
-		t.Fatalf("Expected no error signing message, got %v", err)
-	}
+	require.False(t, keystore.VerifyMessage(sig, pub, []byte("other data")), "cached signature, different data")
+	other, _, err := crypto.GenerateSecp256k1Key(nil)
+	require.NoError(t, err)
+	otherPub, err := keystore.PublicKey(other)
+	require.NoError(t, err)
+	require.False(t, keystore.VerifyMessage(sig, otherPub, data), "cached signature, different key")
 
-	// Verify the message using the public key
-	valid, err := ks.VerifyMessage(privateKey.PublicKey, data, signature)
-	if err != nil {
-		t.Fatalf("Expected no error verifying message, got %v", err)
-	}
-	if !valid {
-		t.Fatal("Expected signature to be valid")
-	}
+	require.False(t, keystore.VerifyMessage("xxxxxx", pub, data))
+	require.False(t, keystore.VerifyMessage(sig, "zz", data))
+	require.False(t, keystore.VerifyMessage("", pub, data))
+	require.False(t, keystore.VerifyMessage(sig, pub, nil))
+}
 
-	// Attempt verification with altered data
-	valid, err = ks.VerifyMessage(privateKey.PublicKey, []byte("tampered-data"), signature)
-	if err != nil {
-		t.Fatalf("Expected no error with verification attempt, got %v", err)
-	}
-	if valid {
-		t.Fatal("Expected signature verification to fail with altered data")
-	}
-
-	// Attempt verification with an invalid signature format
-	invalidSig := "invalid-signature"
-	valid, err = ks.VerifyMessage(privateKey.PublicKey, data, invalidSig)
-	if err == nil {
-		t.Fatal("Expected error with invalid signature format, got nil")
-	}
-	if valid {
-		t.Fatal("Expected invalid signature verification to fail")
+func TestSignVerifyManyKeys(t *testing.T) {
+	// The previous P-256 implementation encoded r, s, X and Y with
+	// big.Int.Bytes(), which drops leading zeros, and ~1.5% of freshly
+	// generated keys failed to verify their own signatures. DER encoding
+	// has no fixed width to get wrong; keep the loop as a regression guard.
+	for i := range 2000 {
+		key, _, err := crypto.GenerateSecp256k1Key(nil)
+		require.NoError(t, err)
+		pub, err := keystore.PublicKey(key)
+		require.NoError(t, err)
+		data := []byte(fmt.Sprint("message ", i))
+		sig, err := keystore.SignMessage(key, data)
+		require.NoError(t, err)
+		require.True(t, keystore.VerifyMessage(sig, pub, data), "iteration %d", i)
 	}
 }
 
-func TestSerializePrivateKey(t *testing.T) {
-	// Generate a test private key
-	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatalf("Failed to generate private key: %v", err)
-	}
+func TestUnmarshalKeyTypes(t *testing.T) {
+	edPriv, edPub, err := crypto.GenerateEd25519Key(nil)
+	require.NoError(t, err)
+	raw, err := edPriv.Raw()
+	require.NoError(t, err)
+	parsed, err := keystore.UnmarshalPrivateKey(raw)
+	require.NoError(t, err)
+	require.True(t, edPriv.Equals(parsed))
 
-	// Serialize the private key
-	serializedKey, err := SerializePrivateKey(privateKey)
-	if err != nil {
-		t.Fatalf("Failed to serialize private key: %v", err)
-	}
+	pubRaw, err := edPub.Raw()
+	require.NoError(t, err)
+	parsedPub, err := keystore.UnmarshalPublicKey(pubRaw)
+	require.NoError(t, err)
+	require.True(t, edPub.Equals(parsedPub))
 
-	// Deserialize the JSON to inspect the fields
-	var keyData PrivateKeyData
-	if err := json.Unmarshal(serializedKey, &keyData); err != nil {
-		t.Fatalf("Failed to unmarshal serialized key: %v", err)
-	}
-
-	// Verify fields
-	if keyData.Curve != privateKey.Curve.Params().Name {
-		t.Errorf("Curve mismatch: expected %s, got %s", privateKey.Curve.Params().Name, keyData.Curve)
-	}
-	if keyData.X != privateKey.X.Text(16) {
-		t.Errorf("X-coordinate mismatch: expected %s, got %s", privateKey.X.Text(16), keyData.X)
-	}
-	if keyData.Y != privateKey.Y.Text(16) {
-		t.Errorf("Y-coordinate mismatch: expected %s, got %s", privateKey.Y.Text(16), keyData.Y)
-	}
-	if keyData.D != privateKey.D.Text(16) {
-		t.Errorf("D value mismatch: expected %s, got %s", privateKey.D.Text(16), keyData.D)
-	}
-}
-
-func TestDeserializePrivateKey(t *testing.T) {
-	// Generate a test private key
-	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatalf("Failed to generate private key: %v", err)
-	}
-
-	// Serialize the private key
-	serializedKey, err := SerializePrivateKey(privateKey)
-	if err != nil {
-		t.Fatalf("Failed to serialize private key: %v", err)
-	}
-
-	// Deserialize the private key
-	deserializedKey, err := DeserializePrivateKey(serializedKey)
-	if err != nil {
-		t.Fatalf("Failed to deserialize private key: %v", err)
-	}
-
-	// Verify fields of the deserialized key match the original
-	if deserializedKey.Curve != privateKey.Curve {
-		t.Errorf("Curve mismatch: expected %s, got %s", privateKey.Curve.Params().Name, deserializedKey.Curve.Params().Name)
-	}
-	if deserializedKey.X.Cmp(privateKey.X) != 0 {
-		t.Errorf("X-coordinate mismatch: expected %s, got %s", privateKey.X, deserializedKey.X)
-	}
-	if deserializedKey.Y.Cmp(privateKey.Y) != 0 {
-		t.Errorf("Y-coordinate mismatch: expected %s, got %s", privateKey.Y, deserializedKey.Y)
-	}
-	if deserializedKey.D.Cmp(privateKey.D) != 0 {
-		t.Errorf("D value mismatch: expected %s, got %s", privateKey.D, deserializedKey.D)
-	}
-}
-
-func TestSerializeAndDeserializePrivateKey(t *testing.T) {
-	// Generate a test private key
-	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatalf("Failed to generate private key: %v", err)
-	}
-
-	// Serialize the private key
-	serializedKey, err := SerializePrivateKey(privateKey)
-	if err != nil {
-		t.Fatalf("Failed to serialize private key: %v", err)
-	}
-
-	// Deserialize the private key
-	deserializedKey, err := DeserializePrivateKey(serializedKey)
-	if err != nil {
-		t.Fatalf("Failed to deserialize private key: %v", err)
-	}
-
-	// Check if the deserialized key is identical to the original
-	if deserializedKey.Curve != privateKey.Curve {
-		t.Errorf("Curve mismatch: expected %s, got %s", privateKey.Curve.Params().Name, deserializedKey.Curve.Params().Name)
-	}
-	if deserializedKey.X.Cmp(privateKey.X) != 0 || deserializedKey.Y.Cmp(privateKey.Y) != 0 {
-		t.Error("Public key mismatch after deserialization")
-	}
-	if deserializedKey.D.Cmp(privateKey.D) != 0 {
-		t.Error("Private scalar D mismatch after deserialization")
-	}
+	sig, err := keystore.SignMessage(edPriv, []byte("hi"))
+	require.NoError(t, err)
+	require.True(t, keystore.VerifyMessage(sig, hex.EncodeToString(pubRaw), []byte("hi")))
 }

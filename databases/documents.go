@@ -1,191 +1,225 @@
 package databases
 
 import (
-	"encoding/json"
-	"errors"
+	"context"
 	"fmt"
+	"iter"
+
+	"github.com/orbitdb/go-orbitdb/internal/block"
+	"github.com/orbitdb/go-orbitdb/oplog"
 )
 
-// Documents represents a database for storing structured documents.
+// DocumentsType is the type name of Documents databases.
+const DocumentsType = "documents"
+
+// DefaultIndexBy is the document field Documents uses as the key.
+const DefaultIndexBy = "_id"
+
+// DocumentsOptions configures a Documents database.
+type DocumentsOptions struct {
+	// IndexBy is the field holding each document's key. Defaults to
+	// DefaultIndexBy.
+	IndexBy string
+}
+
+// Documents stores documents (maps, or structs that encode to maps) keyed
+// by one of their fields.
 type Documents struct {
-	*KeyValue        // Embeds KeyValue for core functionality
-	indexBy   string // Field to index documents by (default: "_id")
+	*Database
+	indexBy string
 }
 
-type DocumentPayload struct {
-	Op    string                 `json:"op"`
-	Key   string                 `json:"key"`
-	Value map[string]interface{} `json:"value"`
+// Document is a stored document, its key and the hash of the entry that
+// stored it.
+type Document struct {
+	Key   string
+	Value map[string]any
+	Hash  string
 }
 
-// NewDocuments creates a new instance of the Documents database.
-func NewDocuments(indexBy string, kv *KeyValue) (*Documents, error) {
+// DocumentsFactory returns a Factory for Documents databases with opts.
+func DocumentsFactory(opts DocumentsOptions) Factory {
+	return func(ctx context.Context, p Params) (Store, error) {
+		return NewDocuments(ctx, p, opts)
+	}
+}
+
+// NewDocuments opens a Documents database.
+func NewDocuments(ctx context.Context, p Params, opts DocumentsOptions) (*Documents, error) {
+	db, err := New(ctx, p)
+	if err != nil {
+		return nil, err
+	}
+	indexBy := opts.IndexBy
 	if indexBy == "" {
-		indexBy = "_id" // Default index field
+		indexBy = DefaultIndexBy
 	}
-
-	if kv == nil {
-		return nil, errors.New("KeyValue instance is required")
-	}
-
-	return &Documents{
-		KeyValue: kv,
-		indexBy:  indexBy,
-	}, nil
+	return &Documents{Database: db, indexBy: indexBy}, nil
 }
 
-// Put adds or updates a document in the database.
-func (d *Documents) Put(doc map[string]interface{}) (string, error) {
-	key, ok := doc[d.indexBy].(string)
-	if !ok || key == "" {
-		return "", fmt.Errorf("document must contain field '%s' as a string", d.indexBy)
-	}
+// Type returns DocumentsType.
+func (*Documents) Type() string { return DocumentsType }
 
-	payload := DocumentPayload{
-		Op:    "PUT",
-		Key:   key,
-		Value: doc,
-	}
+// IndexBy returns the key field.
+func (d *Documents) IndexBy() string { return d.indexBy }
 
-	// Serialize the DocumentPayload directly
-	serializedPayload, err := json.Marshal(payload)
+// Put stores doc under the value of its IndexBy field and returns the hash
+// of the entry. doc may be a map or a struct (encoded through its JSON
+// form).
+func (d *Documents) Put(ctx context.Context, doc any) (string, error) {
+	m, err := toDocument(doc)
 	if err != nil {
-		return "", fmt.Errorf("failed to serialize payload: %w", err)
+		return "", err
 	}
-
-	fmt.Printf("Debug (Put): Serialized Payload: %s\n", string(serializedPayload))
-
-	// Store the serialized payload without additional encoding
-	return d.KeyValue.AddOperation(string(serializedPayload))
+	key := m[d.indexBy]
+	if isFalsy(key) {
+		return "", fmt.Errorf("the provided document doesn't contain field %q", d.indexBy)
+	}
+	return d.AddOperation(ctx, Operation{Op: "PUT", Key: key, Value: m}.payload())
 }
 
-// Get retrieves a document by its index field value (key).
-func (d *Documents) Get(id string) (map[string]interface{}, error) {
-	// Retrieve the stored document
-	value, err := d.KeyValue.Get(id)
+// Del deletes the document with the given key.
+func (d *Documents) Del(ctx context.Context, key string) (string, error) {
+	doc, err := d.get(ctx, key)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get document: %w", err)
+		return "", fmt.Errorf("no document with key %q in the database: %w", key, err)
 	}
-
-	fmt.Printf("Debug (Get): Retrieved value for key '%s': %+v\n", id, value)
-
-	if value == nil {
-		return nil, nil // Document not found
-	}
-
-	// Check if the value is already a map[string]interface{}
-	if payloadMap, ok := value.(map[string]interface{}); ok {
-		// Assume payloadMap is already the document
-		return payloadMap, nil
-	}
-
-	// If value is a JSON string, attempt to deserialize it
-	var payload DocumentPayload
-	err = json.Unmarshal([]byte(value.(string)), &payload)
-	if err != nil {
-		return nil, fmt.Errorf("failed to deserialize document payload: %w", err)
-	}
-
-	return payload.Value, nil // Return the actual document
+	return d.AddOperation(ctx, Operation{Op: "DEL", Key: doc.rawKey, Value: nil}.payload())
 }
 
-// Del deletes a document by its index field value (key).
-func (d *Documents) Del(id string) (string, error) {
-	// Use KeyValue.Del to delete the document
-	return d.KeyValue.Del(id)
+// Get returns the document with the given key, or an error wrapping
+// ErrNotFound. A document stored under a numeric key by another peer is
+// found by the number's decimal form.
+func (d *Documents) Get(ctx context.Context, key string) (*Document, error) {
+	doc, err := d.get(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	return &doc.Document, nil
 }
 
-// Query retrieves documents matching a user-defined filter function.
-func (d *Documents) Query(filterFn func(doc map[string]interface{}) bool) ([]map[string]interface{}, error) {
-	entries, err := d.Log.Values()
-	if err != nil {
-		return nil, fmt.Errorf("failed to retrieve log entries: %w", err)
-	}
-
-	results := make([]map[string]interface{}, 0)
-	for _, entry := range entries {
-		fmt.Printf("Debug (Query): Processing entry with hash %s and payload: %s\n", entry.Hash, entry.Payload)
-
-		var rawPayload DocumentPayload
-
-		// Attempt to unmarshal directly into DocumentPayload
-		err := json.Unmarshal([]byte(entry.Payload), &rawPayload)
+func (d *Documents) get(ctx context.Context, key string) (*documentWithKey, error) {
+	for doc, err := range d.iterate(ctx, 0) {
 		if err != nil {
-			fmt.Printf("Warning (Query): Failed to decode payload for entry %s: %v. Attempting fallback decoding.\n", entry.Hash, err)
+			return nil, err
+		}
+		if doc.Key == key {
+			return &doc, nil
+		}
+	}
+	return nil, fmt.Errorf("%w: %s", ErrNotFound, key)
+}
 
-			// Fallback: Attempt to decode double-encoded payload
-			var doubleEncodedPayload string
-			if json.Unmarshal([]byte(entry.Payload), &doubleEncodedPayload) == nil {
-				if json.Unmarshal([]byte(doubleEncodedPayload), &rawPayload) == nil {
-					fmt.Printf("Debug (Query): Fallback decoding succeeded for entry %s\n", entry.Hash)
-				} else {
-					fmt.Printf("Warning (Query): Fallback decoding failed for entry %s\n", entry.Hash)
-					continue
-				}
-			} else {
-				fmt.Printf("Warning (Query): Double decoding not applicable for entry %s\n", entry.Hash)
-				continue
+// Query returns the documents for which match returns true, most recently
+// written first.
+func (d *Documents) Query(ctx context.Context, match func(doc map[string]any) bool) ([]map[string]any, error) {
+	var out []map[string]any
+	for doc, err := range d.iterate(ctx, 0) {
+		if err != nil {
+			return nil, err
+		}
+		if match(doc.Value) {
+			out = append(out, doc.Value)
+		}
+	}
+	return out, nil
+}
+
+// Iterator yields the current version of every document, most recently
+// written first. amount limits the number of documents; zero or negative
+// means all.
+func (d *Documents) Iterator(ctx context.Context, amount int) iter.Seq2[Document, error] {
+	return func(yield func(Document, error) bool) {
+		for doc, err := range d.iterate(ctx, amount) {
+			if !yield(doc.Document, err) || err != nil {
+				return
 			}
 		}
-
-		// Skip deleted documents
-		if rawPayload.Op == "DEL" {
-			continue
-		}
-
-		// Apply the filter function
-		if filterFn(rawPayload.Value) {
-			results = append(results, rawPayload.Value)
-		}
 	}
-
-	fmt.Printf("Debug (Query): Query results: %+v\n", results)
-	return results, nil
 }
 
-// All retrieves all documents in the database.
-func (d *Documents) All() (map[string]map[string]interface{}, error) {
-	entries, err := d.Log.Values()
-	if err != nil {
-		return nil, fmt.Errorf("failed to retrieve log entries: %w", err)
-	}
+// All returns every document, least recently written first.
+func (d *Documents) All(ctx context.Context) ([]Document, error) {
+	return collectReversed(d.Iterator(ctx, 0))
+}
 
-	results := make(map[string]map[string]interface{})
-	for _, entry := range entries {
-		var rawPayload DocumentPayload
+// documentWithKey keeps the key as it was stored, which may be a number.
+type documentWithKey struct {
+	Document
+	rawKey any
+}
 
-		// Attempt to unmarshal directly into DocumentPayload
-		err := json.Unmarshal([]byte(entry.Payload), &rawPayload)
-		if err != nil {
-			fmt.Printf("Warning: Failed to decode payload for entry %s. Attempting fallback decoding. Payload: %s, Error: %v\n", entry.Hash, entry.Payload, err)
-
-			// Fallback: Attempt to decode double-encoded payload
-			var doubleEncodedPayload string
-			if json.Unmarshal([]byte(entry.Payload), &doubleEncodedPayload) == nil {
-				if json.Unmarshal([]byte(doubleEncodedPayload), &rawPayload) == nil {
-					fmt.Printf("Debug: Fallback decoding succeeded for entry %s\n", entry.Hash)
-				} else {
-					fmt.Printf("Warning: Fallback decoding failed for entry %s\n", entry.Hash)
-					continue
-				}
-			} else {
-				fmt.Printf("Warning: Double decoding not applicable for entry %s\n", entry.Hash)
+func (d *Documents) iterate(ctx context.Context, amount int) iter.Seq2[documentWithKey, error] {
+	return func(yield func(documentWithKey, error) bool) {
+		seen := make(map[string]bool)
+		count := 0
+		for entry, err := range d.log.Iterator(ctx, oplog.IteratorOptions{}) {
+			if err != nil {
+				yield(documentWithKey{}, err)
+				return
+			}
+			op, ok := ParseOperation(entry.Payload)
+			if !ok {
 				continue
 			}
+			key, ok := keyString(op.Key)
+			if !ok || seen[key] {
+				continue
+			}
+			switch op.Op {
+			case "PUT":
+				seen[key] = true
+				value, _ := op.Value.(map[string]any)
+				count++
+				doc := documentWithKey{Document: Document{Key: key, Value: value, Hash: entry.Hash}, rawKey: op.Key}
+				if !yield(doc, nil) {
+					return
+				}
+			case "DEL":
+				seen[key] = true
+			}
+			if amount > 0 && count >= amount {
+				return
+			}
 		}
-
-		// Skip deleted documents
-		if rawPayload.Op == "DEL" {
-			continue
-		}
-
-		// Add to results using the "key" field
-		results[rawPayload.Key] = rawPayload.Value
 	}
+}
 
-	if len(results) == 0 {
-		fmt.Println("Debug: No entries found in the log")
+// toDocument converts doc to the map it is stored as.
+func toDocument(doc any) (map[string]any, error) {
+	if m, ok := doc.(map[string]any); ok {
+		return m, nil
 	}
+	_, data, err := block.Encode(doc)
+	if err != nil {
+		return nil, err
+	}
+	v, err := block.Decode(data)
+	if err != nil {
+		return nil, err
+	}
+	m, ok := v.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("a document must encode to a map, got %T", v)
+	}
+	return m, nil
+}
 
-	return results, nil
+// isFalsy mirrors JavaScript truthiness for the key check in put.
+func isFalsy(v any) bool {
+	switch x := v.(type) {
+	case nil:
+		return true
+	case string:
+		return x == ""
+	case bool:
+		return !x
+	case int:
+		return x == 0
+	case int64:
+		return x == 0
+	case float64:
+		return x == 0
+	}
+	return false
 }

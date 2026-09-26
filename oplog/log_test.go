@@ -1,368 +1,479 @@
-package oplog
+package oplog_test
 
 import (
+	"context"
+	"errors"
+	"fmt"
+	"sync"
 	"testing"
 
-	"orbitdb/go-orbitdb/storage"
+	"github.com/stretchr/testify/require"
+
+	"github.com/orbitdb/go-orbitdb/identities/identitytypes"
+	"github.com/orbitdb/go-orbitdb/oplog"
+	"github.com/orbitdb/go-orbitdb/storage"
 )
 
-func TestNewLog(t *testing.T) {
-	ks, identity := setupTestKeyStoreAndIdentity(t)
+func newLog(t *testing.T, identity *identitytypes.Identity, opts oplog.Options) *oplog.Log {
+	t.Helper()
+	l, err := oplog.NewLog(context.Background(), identity, opts)
+	require.NoError(t, err)
+	return l
+}
 
-	logID := "test-log"
-	entryStorage := storage.NewMemoryStorage()
-	log, err := NewLog(logID, identity, entryStorage, ks)
-	if err != nil {
-		t.Fatalf("Failed to create new log: %v", err)
+func payloads(t *testing.T, l *oplog.Log) []any {
+	t.Helper()
+	values, err := l.Values(context.Background())
+	require.NoError(t, err)
+	out := make([]any, len(values))
+	for i, v := range values {
+		out[i] = v.Payload
+	}
+	return out
+}
+
+func TestAppendAndValues(t *testing.T) {
+	ctx := context.Background()
+	identity := fixtureIdentities(t)("userA")
+	l := newLog(t, identity, oplog.Options{LogID: "A"})
+
+	values, err := l.Values(ctx)
+	require.NoError(t, err)
+	require.Empty(t, values)
+	clock, err := l.Clock(ctx)
+	require.NoError(t, err)
+	require.Equal(t, oplog.NewClock(identity.PublicKey, 0), clock)
+
+	for i := range 5 {
+		e, err := l.Append(ctx, fmt.Sprint("hello", i), oplog.AppendOptions{})
+		require.NoError(t, err)
+		require.NotEmpty(t, e.Hash)
+		require.Equal(t, int64(i+1), e.Clock.Time)
+		require.Equal(t, identity.PublicKey, e.Key)
+		require.Equal(t, identity.Hash, e.Identity)
+
+		heads, err := l.Heads(ctx)
+		require.NoError(t, err)
+		require.Len(t, heads, 1)
+		require.Equal(t, e.Hash, heads[0].Hash)
+
+		has, err := l.Has(ctx, e.Hash)
+		require.NoError(t, err)
+		require.True(t, has)
+		got, err := l.Get(ctx, e.Hash)
+		require.NoError(t, err)
+		require.Equal(t, e.Payload, got.Payload)
+	}
+	require.Equal(t, []any{"hello0", "hello1", "hello2", "hello3", "hello4"}, payloads(t, l))
+
+	_, err = l.Get(ctx, "")
+	require.Error(t, err)
+	_, err = l.Get(ctx, "zdpuAsKzwUEa8cz9pkJxxFMxLuP3cutA9PDGoLZytrg4RSVEa")
+	require.ErrorIs(t, err, storage.ErrNotFound)
+	has, err := l.Has(ctx, "zdpuAsKzwUEa8cz9pkJxxFMxLuP3cutA9PDGoLZytrg4RSVEa")
+	require.NoError(t, err)
+	require.False(t, has)
+}
+
+func TestNewLogValidation(t *testing.T) {
+	_, err := oplog.NewLog(context.Background(), nil, oplog.Options{})
+	require.EqualError(t, err, "identity is required")
+
+	l := newLog(t, fixtureIdentities(t)("userA"), oplog.Options{})
+	require.NotEmpty(t, l.ID(), "a log id is generated")
+}
+
+func TestCreateEntryValidation(t *testing.T) {
+	ctx := context.Background()
+	identity := fixtureIdentities(t)("userA")
+	_, err := oplog.CreateEntry(ctx, nil, "A", "x", oplog.EntryOptions{})
+	require.ErrorContains(t, err, "identity is required")
+	_, err = oplog.CreateEntry(ctx, identity, "", "x", oplog.EntryOptions{})
+	require.ErrorContains(t, err, "requires an id")
+	_, err = oplog.CreateEntry(ctx, identity, "A", nil, oplog.EntryOptions{})
+	require.ErrorContains(t, err, "requires a payload")
+
+	decoded, err := identitytypes.Decode(identity.Bytes)
+	require.NoError(t, err)
+	_, err = oplog.CreateEntry(ctx, decoded, "A", "x", oplog.EntryOptions{})
+	require.ErrorContains(t, err, "no signer", "an identity without keys cannot sign")
+}
+
+func TestVerifyEntryRejectsTampering(t *testing.T) {
+	ctx := context.Background()
+	identity := fixtureIdentities(t)("userA")
+	e, err := oplog.CreateEntry(ctx, identity, "A", "hello", oplog.EntryOptions{})
+	require.NoError(t, err)
+	ok, err := oplog.VerifyEntry(e)
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	for name, mutate := range map[string]func(*oplog.Entry){
+		"payload": func(e *oplog.Entry) { e.Payload = "evil" },
+		"id":      func(e *oplog.Entry) { e.ID = "B" },
+		"clock":   func(e *oplog.Entry) { e.Clock.Time = 99 },
+		"next":    func(e *oplog.Entry) { e.Next = []string{"zdpuAsKzwUEa8cz9pkJxxFMxLuP3cutA9PDGoLZytrg4RSVEa"} },
+		"key":     func(e *oplog.Entry) { e.Key = fixtureIdentities(t)("userB").PublicKey },
+	} {
+		c := *e
+		mutate(&c)
+		ok, err := oplog.VerifyEntry(&c)
+		require.NoError(t, err, name)
+		require.False(t, ok, name)
 	}
 
-	if log == nil {
-		t.Fatal("Expected log to be non-nil")
-	}
+	c := *e
+	c.Sig = ""
+	_, err = oplog.VerifyEntry(&c)
+	require.ErrorContains(t, err, "signature")
+	_, err = oplog.VerifyEntry(&oplog.Entry{})
+	require.ErrorContains(t, err, "invalid log entry")
+}
 
-	if logID != log.ID {
-		t.Errorf("Expected log ID to be '%s', got '%s'", logID, log.ID)
-	}
-
-	if log.Identity != identity {
-		t.Error("Log identity does not match the provided identity")
-	}
-
-	if log.Clock.ID != identity.ID || log.Clock.Time != 0 {
-		t.Errorf("Expected clock to be initialized with ID '%s' and Time 0, got ID '%s' and Time %d",
-			identity.ID, log.Clock.ID, log.Clock.Time)
+func TestDecodeEntryRejectsGarbage(t *testing.T) {
+	ctx := context.Background()
+	for name, data := range map[string][]byte{
+		"empty":     nil,
+		"not cbor":  []byte{0xff, 0x00},
+		"not a map": {0x01},
+		"no id":     {0xa1, 0x61, 0x76, 0x02}, // {"v": 2}
+	} {
+		_, err := oplog.DecodeEntry(ctx, data, oplog.Encryption{})
+		require.Error(t, err, name)
 	}
 }
 
-func TestLog_AppendAndGet(t *testing.T) {
-	ks, identity := setupTestKeyStoreAndIdentity(t)
+func TestJoinTwoWriters(t *testing.T) {
+	ctx := context.Background()
+	identity := fixtureIdentities(t)
+	log1 := newLog(t, identity("userA"), oplog.Options{LogID: "X"})
+	log2 := newLog(t, identity("userB"), oplog.Options{LogID: "X"})
 
-	logID := "test-log"
-	entryStorage := storage.NewMemoryStorage()
-	log, err := NewLog(logID, identity, entryStorage, ks)
-	if err != nil {
-		t.Fatalf("Failed to create new log: %v", err)
+	for i := 1; i <= 10; i++ {
+		_, err := log1.Append(ctx, fmt.Sprint("A", i), oplog.AppendOptions{})
+		require.NoError(t, err)
+		_, err = log2.Append(ctx, fmt.Sprint("B", i), oplog.AppendOptions{})
+		require.NoError(t, err)
 	}
+	require.NoError(t, log1.Join(ctx, log2))
+	require.NoError(t, log2.Join(ctx, log1))
 
-	payloads := []string{"first entry", "second entry", "third entry"}
-	appendedEntries := make([]*EncodedEntry, 0, len(payloads))
+	v1, v2 := payloads(t, log1), payloads(t, log2)
+	require.Len(t, v1, 20)
+	require.Equal(t, v1, v2, "both logs converge to the same order")
+	heads, err := log1.Heads(ctx)
+	require.NoError(t, err)
+	require.Len(t, heads, 2, "concurrent writers leave two heads until the next append")
 
-	for _, payload := range payloads {
-		entry, err := log.Append(payload)
-		if err != nil {
-			t.Fatalf("Failed to append entry: %v", err)
-		}
-		appendedEntries = append(appendedEntries, entry)
-	}
+	e, err := log1.Append(ctx, "merge", oplog.AppendOptions{})
+	require.NoError(t, err)
+	require.Len(t, e.Next, 2, "an append points at every head")
+	require.Equal(t, int64(11), e.Clock.Time)
 
-	for i, appendedEntry := range appendedEntries {
-		retrievedEntry, err := log.Get(appendedEntry.Hash)
-		if err != nil {
-			t.Fatalf("Failed to get entry: %v", err)
-		}
-		if retrievedEntry.Hash != appendedEntry.Hash {
-			t.Errorf("Retrieved entry hash does not match appended entry hash. Expected %s, got %s",
-				appendedEntry.Hash, retrievedEntry.Hash)
-		}
-		if retrievedEntry.Payload != appendedEntry.Payload {
-			t.Errorf("Retrieved entry payload does not match appended entry payload. Expected %s, got %s",
-				appendedEntry.Payload, retrievedEntry.Payload)
-		}
-		if retrievedEntry.Payload != payloads[i] {
-			t.Errorf("Retrieved entry payload does not match expected payload. Expected %s, got %s",
-				payloads[i], retrievedEntry.Payload)
-		}
-	}
+	// Joining again changes nothing.
+	require.NoError(t, log2.Join(ctx, log1))
+	require.NoError(t, log2.Join(ctx, log1))
+	require.Len(t, payloads(t, log2), 21)
 }
 
-func TestLog_AppendAndRetrieve(t *testing.T) {
-	// Step 1: Set up the test keystore and identity
-	ks, identity := setupTestKeyStoreAndIdentity(t)
+func TestJoinEntryFetchesMissingAncestors(t *testing.T) {
+	ctx := context.Background()
+	identity := fixtureIdentities(t)
+	shared := storage.NewMemoryStorage()
+	log1 := newLog(t, identity("userA"), oplog.Options{LogID: "X", EntryStorage: shared})
+	log2 := newLog(t, identity("userB"), oplog.Options{LogID: "X", EntryStorage: shared})
 
-	// Step 2: Create a new log instance
-	logID := "test-log"
-	entryStorage := storage.NewMemoryStorage()
-	log, err := NewLog(logID, identity, entryStorage, ks)
-	if err != nil {
-		t.Fatalf("Failed to create new log: %v", err)
+	var last *oplog.Entry
+	for i := range 5 {
+		var err error
+		last, err = log1.Append(ctx, fmt.Sprint("A", i), oplog.AppendOptions{ReferencesCount: 2})
+		require.NoError(t, err)
 	}
+	updated, err := log2.JoinEntry(ctx, last)
+	require.NoError(t, err)
+	require.True(t, updated)
+	require.Equal(t, []any{"A0", "A1", "A2", "A3", "A4"}, payloads(t, log2))
 
-	// Step 3: Append multiple Entries to the log
-	payloads := []string{"first entry", "second entry", "third entry"}
-	appendedEntries := make([]*EncodedEntry, 0, len(payloads))
-
-	for _, payload := range payloads {
-		entry, err := log.Append(payload)
-		if err != nil {
-			t.Fatalf("Failed to append entry: %v", err)
-		}
-		appendedEntries = append(appendedEntries, entry)
-	}
-
-	// Step 4: Retrieve each appended entry using the Get method and verify
-	for i, appendedEntry := range appendedEntries {
-		retrievedEntry, err := log.Get(appendedEntry.Hash)
-		if err != nil {
-			t.Fatalf("Failed to get entry: %v", err)
-		}
-		if retrievedEntry.Hash != appendedEntry.Hash {
-			t.Errorf("Retrieved entry hash does not match appended entry hash. Expected %s, got %s", appendedEntry.Hash, retrievedEntry.Hash)
-		}
-		if retrievedEntry.Payload != appendedEntry.Payload {
-			t.Errorf("Retrieved entry payload does not match appended entry payload. Expected %s, got %s", appendedEntry.Payload, retrievedEntry.Payload)
-		}
-		if retrievedEntry.Payload != payloads[i] {
-			t.Errorf("Retrieved entry payload does not match expected payload. Expected %s, got %s", payloads[i], retrievedEntry.Payload)
-		}
-	}
-
-	// Step 5: Test the Values method to ensure all Entries are correctly stored and ordered
-	entries, err := log.Values()
-	if err != nil {
-		t.Fatalf("Failed to get log values: %v", err)
-	}
-
-	if len(entries) != len(payloads) {
-		t.Errorf("Expected %d Entries, got %d", len(payloads), len(entries))
-	}
-
-	// The Entries should be sorted in the order they were appended
-	for i, entry := range entries {
-		if entry.Payload != payloads[i] {
-			t.Errorf("Entry %d payload mismatch: expected '%s', got '%s'", i, payloads[i], entry.Payload)
-		}
-	}
+	updated, err = log2.JoinEntry(ctx, last)
+	require.NoError(t, err)
+	require.False(t, updated, "joining an entry twice is a no-op")
 }
 
-func TestLog_Values(t *testing.T) {
-	ks, identity := setupTestKeyStoreAndIdentity(t)
+func TestJoinEntryErrors(t *testing.T) {
+	ctx := context.Background()
+	identity := fixtureIdentities(t)
+	logA := newLog(t, identity("userA"), oplog.Options{LogID: "AAA"})
+	logB := newLog(t, identity("userA"), oplog.Options{LogID: "BBB"})
+	_, err := logA.Append(ctx, "entryA", oplog.AppendOptions{})
+	require.NoError(t, err)
+	eb, err := logB.Append(ctx, "entryB", oplog.AppendOptions{})
+	require.NoError(t, err)
 
-	logID := "test-log"
-	entryStorage := storage.NewMemoryStorage()
-	log, err := NewLog(logID, identity, entryStorage, ks)
-	if err != nil {
-		t.Fatalf("Failed to create new log: %v", err)
-	}
+	_, err = logA.JoinEntry(ctx, eb)
+	require.EqualError(t, err, "entry's id (BBB) doesn't match the log's id (AAA)")
+	require.EqualError(t, logA.Join(ctx, logB), "entry's id (BBB) doesn't match the log's id (AAA)")
+	require.EqualError(t, logA.Join(ctx, nil), "log instance not defined")
 
-	payloads := []string{"entry1", "entry2", "entry3"}
-	for _, payload := range payloads {
-		_, err := log.Append(payload)
-		if err != nil {
-			t.Fatalf("Failed to append entry: %v", err)
-		}
-	}
+	// An entry whose ancestors are nowhere to be found cannot be joined.
+	isolated := newLog(t, identity("userB"), oplog.Options{LogID: "X"})
+	src := newLog(t, identity("userA"), oplog.Options{LogID: "X"})
+	_, err = src.Append(ctx, "one", oplog.AppendOptions{})
+	require.NoError(t, err)
+	two, err := src.Append(ctx, "two", oplog.AppendOptions{})
+	require.NoError(t, err)
+	_, err = isolated.JoinEntry(ctx, two)
+	require.ErrorIs(t, err, storage.ErrNotFound)
+	require.Empty(t, payloads(t, isolated), "a failed join leaves the log unchanged")
 
-	entries, err := log.Values()
-	if err != nil {
-		t.Fatalf("Failed to get log values: %v", err)
-	}
+	// A tampered block, as a malicious peer would send it, is rejected.
+	tampered := *two
+	tampered.Payload = "evil"
+	_, data, err := oplog.EncodeEntry(ctx, &tampered, oplog.Encryption{})
+	require.NoError(t, err)
+	received, err := oplog.DecodeEntry(ctx, data, oplog.Encryption{})
+	require.NoError(t, err)
+	_, err = newLog(t, identity("userB"), oplog.Options{LogID: "X"}).JoinEntry(ctx, received)
+	require.ErrorContains(t, err, "could not validate signature")
 
-	if len(entries) != len(payloads) {
-		t.Errorf("Expected %d Entries, got %d", len(payloads), len(entries))
-	}
-
-	for i, entry := range entries {
-		if entry.Payload != payloads[i] {
-			t.Errorf("Entry %d payload mismatch: expected '%s', got '%s'",
-				i, payloads[i], entry.Payload)
-		}
-	}
+	_, err = isolated.JoinEntry(ctx, &oplog.Entry{ID: "X"})
+	require.ErrorContains(t, err, "no hash")
 }
 
-func TestLog_Traverse(t *testing.T) {
-	ks, identity := setupTestKeyStoreAndIdentity(t)
+func TestJoinEntryVerifiesWhatItStores(t *testing.T) {
+	ctx := context.Background()
+	identity := fixtureIdentities(t)
+	shared := storage.NewMemoryStorage()
+	src := newLog(t, identity("userA"), oplog.Options{LogID: "X", EntryStorage: shared})
+	e, err := src.Append(ctx, "original", oplog.AppendOptions{})
+	require.NoError(t, err)
+	data, err := shared.Get(ctx, e.Hash)
+	require.NoError(t, err)
+	decoded, err := oplog.DecodeEntry(ctx, data, oplog.Encryption{})
+	require.NoError(t, err)
 
-	logID := "test-log"
-	entryStorage := storage.NewMemoryStorage()
-	log, err := NewLog(logID, identity, entryStorage, ks)
-	if err != nil {
-		t.Fatalf("Failed to create new log: %v", err)
-	}
+	// Changing a decoded entry does not change what is joined: the log
+	// works from the block the entry was decoded from.
+	decoded.Payload = "changed"
+	decoded.Identity = "zdpuArx43BnXdDff5rjrGLYrxUomxNroc2uaocTgcWK76UfQT"
+	dst := newLog(t, identity("userB"), oplog.Options{LogID: "X"})
+	updated, err := dst.JoinEntry(ctx, decoded)
+	require.NoError(t, err)
+	require.True(t, updated)
+	require.Equal(t, []any{"original"}, payloads(t, dst))
+	stored, err := dst.Storage().Get(ctx, e.Hash)
+	require.NoError(t, err)
+	require.Equal(t, data, stored, "the original block is stored under its hash")
+}
 
-	payloads := []string{"entry1", "entry2", "entry3", "entry4", "entry5"}
-	for _, payload := range payloads {
-		_, err := log.Append(payload)
-		if err != nil {
-			t.Fatalf("Failed to append entry: %v", err)
-		}
+type denyWriter struct{ denied string }
+
+func (d denyWriter) CanAppend(_ context.Context, e *oplog.Entry) (bool, error) {
+	return e.Identity != d.denied, nil
+}
+
+type failingAccess struct{}
+
+func (failingAccess) CanAppend(context.Context, *oplog.Entry) (bool, error) {
+	return false, errors.New("acl unavailable")
+}
+
+func TestAccessController(t *testing.T) {
+	ctx := context.Background()
+	identity := fixtureIdentities(t)
+	userB := identity("userB")
+	access := denyWriter{denied: userB.Hash}
+
+	logB := newLog(t, userB, oplog.Options{LogID: "X", AccessController: access})
+	_, err := logB.Append(ctx, "nope", oplog.AppendOptions{})
+	require.ErrorContains(t, err, "is not allowed to write to the log")
+	require.ErrorContains(t, err, userB.Hash)
+
+	openB := newLog(t, userB, oplog.Options{LogID: "X"})
+	entry, err := openB.Append(ctx, "from B", oplog.AppendOptions{})
+	require.NoError(t, err)
+	logA := newLog(t, identity("userA"), oplog.Options{LogID: "X", AccessController: access})
+	require.ErrorContains(t, logA.Join(ctx, openB), "is not allowed to write to the log")
+	_, err = logA.JoinEntry(ctx, entry)
+	require.ErrorContains(t, err, "is not allowed to write to the log")
+
+	failing := newLog(t, identity("userA"), oplog.Options{LogID: "X", AccessController: failingAccess{}})
+	_, err = failing.Append(ctx, "x", oplog.AppendOptions{})
+	require.ErrorContains(t, err, "acl unavailable")
+}
+
+func TestHeadsPersistAcrossReopen(t *testing.T) {
+	ctx := context.Background()
+	identity := fixtureIdentities(t)("userA")
+	dir := t.TempDir()
+	entries := storage.NewMemoryStorage() // stands in for IPFS, which outlives the log
+	open := func() *oplog.Log {
+		heads, err := storage.NewLevelStorage(dir + "/heads")
+		require.NoError(t, err)
+		index, err := storage.NewLevelStorage(dir + "/index")
+		require.NoError(t, err)
+		return newLog(t, identity, oplog.Options{LogID: "P", EntryStorage: entriesNoClose{entries}, HeadsStorage: heads, IndexStorage: index})
 	}
+	l := open()
+	for i := range 3 {
+		_, err := l.Append(ctx, fmt.Sprint("p", i), oplog.AppendOptions{})
+		require.NoError(t, err)
+	}
+	require.NoError(t, l.Close())
+
+	l = open()
+	defer l.Close()
+	require.Equal(t, []any{"p0", "p1", "p2"}, payloads(t, l))
+	e, err := l.Append(ctx, "p3", oplog.AppendOptions{})
+	require.NoError(t, err)
+	require.Equal(t, int64(4), e.Clock.Time, "the clock continues from the persisted heads")
+}
+
+type entriesNoClose struct{ storage.Storage }
+
+func (entriesNoClose) Close() error { return nil }
+
+func TestLogHeadsOption(t *testing.T) {
+	ctx := context.Background()
+	identity := fixtureIdentities(t)("userA")
+	shared := storage.NewMemoryStorage()
+	l1 := newLog(t, identity, oplog.Options{LogID: "H", EntryStorage: shared})
+	var entries []*oplog.Entry
+	for i := range 3 {
+		e, err := l1.Append(ctx, fmt.Sprint("h", i), oplog.AppendOptions{})
+		require.NoError(t, err)
+		entries = append(entries, e)
+	}
+	l2 := newLog(t, identity, oplog.Options{LogID: "H", EntryStorage: shared, LogHeads: entries[1:2]})
+	require.Equal(t, []any{"h0", "h1"}, payloads(t, l2), "the log starts from the given heads")
+}
+
+func TestClear(t *testing.T) {
+	ctx := context.Background()
+	l := newLog(t, fixtureIdentities(t)("userA"), oplog.Options{LogID: "C"})
+	_, err := l.Append(ctx, "x", oplog.AppendOptions{})
+	require.NoError(t, err)
+	require.NoError(t, l.Clear(ctx))
+	require.Empty(t, payloads(t, l))
+	heads, err := l.Heads(ctx)
+	require.NoError(t, err)
+	require.Empty(t, heads)
+}
+
+func TestTraverseStopsAndBreaks(t *testing.T) {
+	ctx := context.Background()
+	l := newLog(t, fixtureIdentities(t)("userA"), oplog.Options{LogID: "T"})
+	for i := range 10 {
+		_, err := l.Append(ctx, i, oplog.AppendOptions{})
+		require.NoError(t, err)
+	}
+	var seen []any
+	stop := func(e *oplog.Entry) (bool, error) { return e.Payload == int64(6), nil }
+	for e, err := range l.Traverse(ctx, nil, stop) {
+		require.NoError(t, err)
+		seen = append(seen, e.Payload)
+	}
+	require.Equal(t, []any{int64(9), int64(8), int64(7), int64(6)}, seen)
 
 	count := 0
-	shouldStop := func(e *EncodedEntry) bool {
+	for range l.Traverse(ctx, nil, nil) {
 		count++
-		return count >= 3
-	}
-
-	traversedEntries, err := log.Traverse("", shouldStop)
-	if err != nil {
-		t.Fatalf("Failed to traverse log: %v", err)
-	}
-
-	if len(traversedEntries) != 3 {
-		t.Errorf("Expected to traverse 3 Entries, got %d", len(traversedEntries))
-	}
-
-	for i, entry := range traversedEntries {
-		expectedPayload := payloads[len(payloads)-1-i]
-		if entry.Payload != expectedPayload {
-			t.Errorf("Traversed entry %d payload mismatch: expected '%s', got '%s'",
-				i, expectedPayload, entry.Payload)
+		if count == 2 {
+			break
 		}
 	}
-}
+	require.Equal(t, 2, count)
 
-func TestLog_JoinEntry(t *testing.T) {
-	ks, identity := setupTestKeyStoreAndIdentity(t)
-
-	logID := "test-log"
-	entryStorage := storage.NewMemoryStorage()
-	log, err := NewLog(logID, identity, entryStorage, ks)
-	if err != nil {
-		t.Fatalf("Failed to create log: %v", err)
-	}
-
-	// Create a new entry to join
-	clock := NewClock(identity.ID, 1)
-	entry := NewEntry(ks, identity, logID, "joined entry", clock, nil, nil)
-
-	processed := make(map[string]bool)
-	err = log.JoinEntry(&entry, processed)
-	if err != nil {
-		t.Fatalf("Failed to join entry: %v", err)
-	}
-
-	retrievedEntry, err := log.Get(entry.Hash)
-	if err != nil {
-		t.Fatalf("Failed to get entry: %v", err)
-	}
-
-	if retrievedEntry.Hash != entry.Hash {
-		t.Errorf("Joined entry hash does not match. Expected %s, got %s",
-			entry.Hash, retrievedEntry.Hash)
-	}
-	if retrievedEntry.Payload != entry.Payload {
-		t.Errorf("Joined entry payload does not match. Expected '%s', got '%s'",
-			entry.Payload, retrievedEntry.Payload)
-	}
-}
-
-func TestLog_Join(t *testing.T) {
-	ks, identity := setupTestKeyStoreAndIdentity(t)
-
-	logID := "test-log"
-	entryStorage1 := storage.NewMemoryStorage()
-	log1, err := NewLog(logID, identity, entryStorage1, ks)
-	if err != nil {
-		t.Fatalf("Failed to create log1: %v", err)
-	}
-
-	entryStorage2 := storage.NewMemoryStorage()
-	log2, err := NewLog(logID, identity, entryStorage2, ks)
-	if err != nil {
-		t.Fatalf("Failed to create log2: %v", err)
-	}
-
-	payloads1 := []string{"entry1-log1", "entry2-log1"}
-	for _, payload := range payloads1 {
-		_, err := log1.Append(payload)
+	boom := errors.New("boom")
+	var gotErr error
+	for _, err := range l.Traverse(ctx, nil, func(*oplog.Entry) (bool, error) { return false, boom }) {
 		if err != nil {
-			t.Fatalf("Failed to append to log1: %v", err)
+			gotErr = err
 		}
 	}
+	require.ErrorIs(t, gotErr, boom)
 
-	payloads2 := []string{"entry1-log2", "entry2-log2"}
-	for _, payload := range payloads2 {
-		_, err := log2.Append(payload)
-		if err != nil {
-			t.Fatalf("Failed to append to log2: %v", err)
-		}
+	empty := 0
+	for range l.Traverse(ctx, []*oplog.Entry{}, nil) {
+		empty++
 	}
-
-	err = log1.Join(log2)
-	if err != nil {
-		t.Fatalf("Failed to join log2 into log1: %v", err)
-	}
-
-	entries, err := log1.Values()
-	if err != nil {
-		t.Fatalf("Failed to get log1 values: %v", err)
-	}
-
-	expectedEntryCount := len(payloads1) + len(payloads2)
-	if len(entries) != expectedEntryCount {
-		t.Errorf("Expected %d Entries after join, got %d",
-			expectedEntryCount, len(entries))
-	}
-
-	// Optionally, check that the Entries contain the expected payloads
-	payloadSet := make(map[string]bool)
-	for _, payload := range append(payloads1, payloads2...) {
-		payloadSet[payload] = true
-	}
-	for _, entry := range entries {
-		if !payloadSet[entry.Payload] {
-			t.Errorf("Unexpected entry payload: '%s'", entry.Payload)
-		}
-	}
+	require.Zero(t, empty, "an empty, non-nil root set traverses nothing")
 }
 
-func TestLog_Clear(t *testing.T) {
-	ks, identity := setupTestKeyStoreAndIdentity(t)
+func TestConcurrentAppendAndJoin(t *testing.T) {
+	ctx := context.Background()
+	identity := fixtureIdentities(t)
+	shared := storage.NewMemoryStorage()
+	log1 := newLog(t, identity("userA"), oplog.Options{LogID: "R", EntryStorage: shared})
+	log2 := newLog(t, identity("userB"), oplog.Options{LogID: "R", EntryStorage: shared})
 
-	logID := "test-log"
-	entryStorage := storage.NewMemoryStorage()
-	log, err := NewLog(logID, identity, entryStorage, ks)
-	if err != nil {
-		t.Fatalf("Failed to create log: %v", err)
+	var wg sync.WaitGroup
+	for w, l := range []*oplog.Log{log1, log2} {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range 25 {
+				_, err := l.Append(ctx, fmt.Sprint(w, "-", i), oplog.AppendOptions{ReferencesCount: 4})
+				require.NoError(t, err)
+			}
+		}()
 	}
-
-	payloads := []string{"entry1", "entry2", "entry3"}
-	for _, payload := range payloads {
-		_, err := log.Append(payload)
-		if err != nil {
-			t.Fatalf("Failed to append entry: %v", err)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for range 10 {
+			require.NoError(t, log1.Join(ctx, log2))
+			for range log1.Traverse(ctx, nil, nil) {
+			}
 		}
-	}
-
-	err = log.Clear()
-	if err != nil {
-		t.Fatalf("Failed to clear the log: %v", err)
-	}
-
-	entries, err := log.Values()
-	if err != nil {
-		t.Fatalf("Failed to get log values: %v", err)
-	}
-
-	if len(entries) != 0 {
-		t.Errorf("Expected 0 Entries after clear, got %d", len(entries))
-	}
-
-	head := log.Head
-	if head != nil {
-		t.Errorf("Expected head to be nil after clear, but got head with hash %s", head.Hash)
-	}
+	}()
+	wg.Wait()
+	require.NoError(t, log1.Join(ctx, log2))
+	require.NoError(t, log2.Join(ctx, log1))
+	require.Len(t, payloads(t, log1), 50)
+	require.Equal(t, payloads(t, log1), payloads(t, log2))
 }
 
-func TestLog_Head(t *testing.T) {
-	ks, identity := setupTestKeyStoreAndIdentity(t)
+func TestClockAndConflictResolution(t *testing.T) {
+	a, b := oplog.NewClock("A", 1), oplog.NewClock("B", 1)
+	require.Negative(t, oplog.CompareClocks(a, b))
+	require.Positive(t, oplog.CompareClocks(b, a))
+	require.Zero(t, oplog.CompareClocks(a, a))
+	require.Negative(t, oplog.CompareClocks(oplog.NewClock("B", 1), oplog.NewClock("A", 2)), "time wins over id")
+	require.Equal(t, oplog.NewClock("A", 2), oplog.TickClock(a))
 
-	logID := "test-log"
-	entryStorage := storage.NewMemoryStorage()
-	log, err := NewLog(logID, identity, entryStorage, ks)
-	if err != nil {
-		t.Fatalf("Failed to create log: %v", err)
+	e := func(id string, time int64) *oplog.Entry { return &oplog.Entry{Clock: oplog.NewClock(id, time)} }
+	require.Negative(t, oplog.LastWriteWins(e("A", 1), e("A", 2)))
+	require.Positive(t, oplog.LastWriteWins(e("A", 3), e("A", 2)))
+	require.Negative(t, oplog.LastWriteWins(e("A", 1), e("B", 1)))
+	require.Zero(t, oplog.LastWriteWins(e("A", 1), e("A", 1)))
+
+	byID := func(a, b *oplog.Entry) int {
+		return oplog.SortByClockID(a, b, func(*oplog.Entry, *oplog.Entry) int { return 7 })
 	}
+	require.Equal(t, 7, byID(e("A", 1), e("A", 9)), "same id defers to the resolver")
+	require.Negative(t, byID(e("A", 9), e("B", 1)))
+}
 
-	entry, err := log.Append("first entry")
-	if err != nil {
-		t.Fatalf("Failed to append entry: %v", err)
+func TestFindHeads(t *testing.T) {
+	a := &oplog.Entry{Hash: "a"}
+	b := &oplog.Entry{Hash: "b", Next: []string{"a"}}
+	c := &oplog.Entry{Hash: "c", Next: []string{"a"}}
+	d := &oplog.Entry{Hash: "d", Next: []string{"b"}}
+	require.Equal(t, []*oplog.Entry{c, d}, oplog.FindHeads([]*oplog.Entry{a, b, c, d}))
+	require.Empty(t, oplog.FindHeads(nil))
+}
+
+func TestCustomSortFn(t *testing.T) {
+	ctx := context.Background()
+	identity := fixtureIdentities(t)
+	// Reverse the default order: first write wins.
+	reverse := func(a, b *oplog.Entry) int { return -oplog.LastWriteWins(a, b) }
+	l := newLog(t, identity("userA"), oplog.Options{LogID: "S", SortFn: reverse})
+	for i := range 3 {
+		_, err := l.Append(ctx, i, oplog.AppendOptions{})
+		require.NoError(t, err)
 	}
-
-	head := log.Head
-
-	if head.Hash != entry.Hash {
-		t.Errorf("Head hash does not match the last appended entry. Expected %s, got %s",
-			entry.Hash, head.Hash)
-	}
+	// A linear log still traverses newest to oldest because entries are
+	// only reachable through their successors.
+	require.Equal(t, []any{int64(0), int64(1), int64(2)}, payloads(t, l))
 }

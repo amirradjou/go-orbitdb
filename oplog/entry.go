@@ -1,412 +1,291 @@
 package oplog
 
 import (
-	"bytes"
-	"github.com/ipfs/go-cid"
-	"github.com/ipld/go-ipld-prime/codec/dagcbor"
-	"github.com/ipld/go-ipld-prime/datamodel"
-	"github.com/ipld/go-ipld-prime/node/basicnode"
-	"github.com/multiformats/go-multibase"
-	mh "github.com/multiformats/go-multihash"
-	"log"
-	"orbitdb/go-orbitdb/identities/identitytypes"
-	"orbitdb/go-orbitdb/keystore"
-	"sort"
+	"context"
+	"errors"
+	"fmt"
+
+	"github.com/orbitdb/go-orbitdb/identities/identitytypes"
+	"github.com/orbitdb/go-orbitdb/internal/block"
+	"github.com/orbitdb/go-orbitdb/keystore"
 )
 
+// EntryVersion is the version tag of the entry format ("v" field).
+const EntryVersion = 2
+
+// Entry is a signed, content-addressed log entry.
+//
+// Its dag-cbor encoding is byte-compatible with @orbitdb/core 4: the map
+// {id, payload, next, refs, clock: {id, time}, v, key, identity, sig},
+// where sig signs the encoding of the first six fields.
 type Entry struct {
-	ID        string   `json:"ID"`
-	Payload   string   `json:"payload"`
-	Next      []string `json:"next"`
-	Refs      []string `json:"refs"`
-	Clock     Clock    `json:"clock"`
-	V         int      `json:"v"`
-	Key       string   `json:"key"`
-	Identity  string   `json:"identity"`
-	Signature string   `json:"sig"`
+	// ID is the id of the log the entry belongs to.
+	ID string
+	// Payload is any value dag-cbor can encode; see package block for the
+	// Go types it maps to.
+	Payload any
+	// Next holds the hashes of the log heads the entry was appended on.
+	Next []string
+	// Refs holds hashes of older entries, to speed up traversal.
+	Refs  []string
+	Clock Clock
+	V     int64
+	// Key is the public key of the writer's identity.
+	Key string
+	// Identity is the hash of the writer's identity block.
+	Identity string
+	// Sig is the writer's signature of the entry.
+	Sig string
+	// Hash is the base58btc CID of the stored entry block. It is set once
+	// the entry has been stored or decoded.
+	Hash string
+
+	// encryptedPayload is the ciphertext stored in place of Payload when
+	// the log encrypts payloads.
+	encryptedPayload []byte
+	// block is the stored block Hash addresses, once known. Joined entries
+	// are stored with these exact bytes: re-encoding an encrypted entry
+	// would produce different ciphertext and so a different hash.
+	block []byte
 }
 
-type EncodedEntry struct {
-	Entry
-	Bytes []byte
-	CID   cid.Cid
-	Hash  string
+// Encrypter encrypts and decrypts bytes. An implementation is given to a log
+// through Encryption.
+type Encrypter interface {
+	Encrypt(ctx context.Context, plaintext []byte) ([]byte, error)
+	Decrypt(ctx context.Context, ciphertext []byte) ([]byte, error)
 }
 
-func (e EncodedEntry) GetBase58CID() string {
-	// Convert CID to base58btc encoding
-	cidBase58, _ := e.CID.StringOfBase(multibase.Base58BTC)
-	return cidBase58
+// Encryption configures the optional encryption hooks of @orbitdb/core 4.
+// Both are off when nil.
+type Encryption struct {
+	// Replication encrypts whole entry blocks, so storage and the network
+	// only see ciphertext. The stored block is the dag-cbor byte string of
+	// the ciphertext.
+	Replication Encrypter
+	// Data encrypts entry payloads. The payload is encoded as dag-cbor,
+	// encrypted, and the ciphertext is what gets signed and stored.
+	Data Encrypter
 }
 
-// NewEntry creates a new log entry, signing it with the KeyStore.
-func NewEntry(ks *keystore.KeyStore, identity *identitytypes.Identity, id string, payload string, clock Clock, next []string, refs []string) EncodedEntry {
+// EntryOptions configures CreateEntry.
+type EntryOptions struct {
+	// Clock of the entry. Defaults to time 0 on the identity's public key.
+	Clock *Clock
+	Next  []string
+	Refs  []string
+	// EncryptPayload, if set, encrypts the payload (see Encryption.Data).
+	EncryptPayload Encrypter
+}
+
+// CreateEntry creates and signs an entry for log logID. The entry is not
+// stored; its Hash is empty until it is.
+func CreateEntry(ctx context.Context, identity *identitytypes.Identity, logID string, payload any, opts EntryOptions) (*Entry, error) {
 	if identity == nil {
-		panic("Identity is required, cannot create entry")
+		return nil, errors.New("identity is required, cannot create entry")
 	}
-	if id == "" || payload == "" {
-		panic("Entry requires an ID and payload")
+	if logID == "" {
+		return nil, errors.New("entry requires an id")
 	}
-	// Initialize next and refs as empty slices if nil
-	if next == nil {
-		next = []string{}
-	} else {
-		sort.Strings(next)
+	if payload == nil {
+		return nil, errors.New("entry requires a payload")
 	}
-	if refs == nil {
-		refs = []string{}
-	} else {
-		sort.Strings(refs)
+	clock := NewClock(identity.PublicKey, 0)
+	if opts.Clock != nil {
+		clock = *opts.Clock
 	}
-
-	// Create an entry without Key, Identity, and Signature
-	entry := Entry{
-		ID:      id,
+	entry := &Entry{
+		ID:      logID,
 		Payload: payload,
-		Next:    next,
-		Refs:    refs,
-		Clock:   clockOrDefault(clock, identity),
-		V:       2,
+		Next:    nonNil(opts.Next),
+		Refs:    nonNil(opts.Refs),
+		Clock:   clock,
+		V:       EntryVersion,
 	}
-
-	// Encode the entry to CBOR
-	encodedEntry := Encode(entry)
-
-	// Sign the encoded entry data
-	signature, err := ks.SignMessage(identity.ID, encodedEntry.Bytes)
-	if err != nil {
-		panic(err)
-	}
-
-	// Now assign Key, Identity, and Signature fields
-	entry.Key = identity.PublicKey
-	entry.Identity = identity.Hash
-	entry.Signature = signature
-
-	return Encode(entry)
-}
-
-// VerifyEntrySignature verifies the signature on an entry using KeyStore.
-func VerifyEntrySignature(ks *keystore.KeyStore, encodedEntry EncodedEntry) bool {
-	// Recreate the encodedEntry data without Signature, Key, and Identity fields
-	entryData := Entry{
-		ID:      encodedEntry.Entry.ID,
-		Payload: encodedEntry.Entry.Payload,
-		Next:    encodedEntry.Entry.Next,
-		Refs:    encodedEntry.Entry.Refs,
-		Clock:   encodedEntry.Entry.Clock,
-		V:       encodedEntry.Entry.V,
-	}
-
-	// Ensure that Next and Refs are initialized as empty slices if nil
-	if entryData.Next == nil {
-		entryData.Next = []string{}
-	}
-	if entryData.Refs == nil {
-		entryData.Refs = []string{}
-	}
-
-	// Encode the encodedEntry data without the Key, Identity, and Signature fields
-	reconstructedEncodedEntry := Encode(entryData)
-
-	pubKey, err := keystore.ReconstructPublicKeyFromHex(encodedEntry.Entry.Key)
-	if err != nil {
-		log.Printf("Error reconstructing public key: %v\n", err)
-		return false
-	}
-
-	// Verify the signature using the public key from the entry
-	verified, err := ks.VerifyMessage(*pubKey, reconstructedEncodedEntry.Bytes, encodedEntry.Signature)
-	return err == nil && verified
-}
-
-// IsEntry checks if an object is a valid entry
-func IsEntry(entry Entry) bool {
-	return entry.ID != "" && entry.Payload != "" && entry.Clock.ID != "" && entry.Clock.Time > 0
-}
-
-// IsEqual checks if two Entries are equal. Exclude Signature, Hash, and Bytes from the comparison since they can differ even if the Entries have the same content.
-// The reason is The ECDSA algorithm uses a random value (k) during the signing process to ensure that each signature is unique and secure.
-// Even if the same message is signed multiple times with the same private key, the signatures will be different due to this randomness.
-func IsEqual(entry1 EncodedEntry, entry2 EncodedEntry) bool {
-	return entry1.Entry.ID == entry2.Entry.ID &&
-		entry1.Entry.Payload == entry2.Entry.Payload &&
-		EqualStringSlices(entry1.Entry.Next, entry2.Entry.Next) &&
-		EqualStringSlices(entry1.Entry.Refs, entry2.Entry.Refs) &&
-		entry1.Entry.Clock.ID == entry2.Entry.Clock.ID &&
-		entry1.Entry.Clock.Time == entry2.Entry.Clock.Time &&
-		entry1.Entry.V == entry2.Entry.V &&
-		entry1.Entry.Key == entry2.Entry.Key &&
-		entry1.Entry.Identity == entry2.Entry.Identity
-}
-
-func EqualStringSlices(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
+	if opts.EncryptPayload != nil {
+		_, plain, err := block.Encode(payload)
+		if err != nil {
+			return nil, fmt.Errorf("encode payload: %w", err)
+		}
+		if entry.encryptedPayload, err = opts.EncryptPayload.Encrypt(ctx, plain); err != nil {
+			return nil, fmt.Errorf("encrypt payload: %w", err)
 		}
 	}
-	return true
-}
-
-// Encode encodes the entry into CBOR and returns an EncodedEntry
-func Encode(entry Entry) EncodedEntry {
-	// Create a basic map node for encoding
-	nb := basicnode.Prototype__Map{}.NewBuilder()
-	ma, err := nb.BeginMap(9)
-	if err != nil {
-		panic(err)
-	}
-
-	// Assemble each field using helper functions
-	if err := assembleStringField(ma, "ID", entry.ID); err != nil {
-		panic(err)
-	}
-
-	if err := assembleStringField(ma, "payload", entry.Payload); err != nil {
-		panic(err)
-	}
-
-	if err := assembleStringList(ma, "next", entry.Next); err != nil {
-		panic(err)
-	}
-
-	if err := assembleStringList(ma, "refs", entry.Refs); err != nil {
-		panic(err)
-	}
-
-	if err := assembleClock(ma, "clock", entry.Clock); err != nil {
-		panic(err)
-	}
-
-	if err := assembleIntField(ma, "v", int64(entry.V)); err != nil {
-		panic(err)
-	}
-
-	if err := assembleStringField(ma, "key", entry.Key); err != nil {
-		panic(err)
-	}
-
-	if err := assembleStringField(ma, "identity", entry.Identity); err != nil {
-		panic(err)
-	}
-
-	if err := assembleStringField(ma, "sig", entry.Signature); err != nil {
-		panic(err)
-	}
-
-	// Finish assembling the map
-	if err := ma.Finish(); err != nil {
-		panic(err)
-	}
-
-	// Get the final built node
-	node := nb.Build()
-
-	// Encode to CBOR
-	var buf bytes.Buffer
-	if err := dagcbor.Encode(node, &buf); err != nil {
-		panic(err)
-	}
-
-	// Calculate CID for CBOR-encoded bytes
-	hash, err := mh.Sum(buf.Bytes(), mh.SHA2_256, -1)
-	if err != nil {
-		panic(err)
-	}
-	c := cid.NewCidV1(cid.DagCBOR, hash)
-
-	// Encode CID to base58btc for the hash
-	hashStr, err := c.StringOfBase(multibase.Base58BTC)
-	if err != nil {
-		panic(err)
-	}
-
-	return EncodedEntry{Entry: entry, Bytes: buf.Bytes(), CID: c, Hash: hashStr}
-}
-
-// Decode decodes CBOR-encoded data into an EncodedEntry struct
-func Decode(encodedData []byte) (EncodedEntry, error) {
-	// Create a node builder for decoding
-	nb := basicnode.Prototype.Any.NewBuilder()
-	buf := bytes.NewReader(encodedData)
-
-	// Decode the CBOR data
-	if err := dagcbor.Decode(nb, buf); err != nil {
-		return EncodedEntry{}, err
-	}
-	node := nb.Build()
-
-	// Extract values from the node using helper functions
-	var entry Entry
-	var err error
-
-	if entry.ID, err = getString(node, "ID"); err != nil {
-		return EncodedEntry{}, err
-	}
-	if entry.Payload, err = getString(node, "payload"); err != nil {
-		return EncodedEntry{}, err
-	}
-	if v, err := getInt(node, "v"); err == nil {
-		entry.V = int(v)
-	} else {
-		return EncodedEntry{}, err
-	}
-	if entry.Key, err = getString(node, "key"); err != nil {
-		return EncodedEntry{}, err
-	}
-	if entry.Identity, err = getString(node, "identity"); err != nil {
-		return EncodedEntry{}, err
-	}
-	if entry.Signature, err = getString(node, "sig"); err != nil {
-		return EncodedEntry{}, err
-	}
-
-	// Decode nested Clock
-	clockNode, err := node.LookupByString("clock")
-	if err != nil {
-		return EncodedEntry{}, err
-	}
-	if entry.Clock.ID, err = getString(clockNode, "ID"); err != nil {
-		return EncodedEntry{}, err
-	}
-	if timeVal, err := getInt(clockNode, "time"); err == nil {
-		entry.Clock.Time = int(timeVal)
-	} else {
-		return EncodedEntry{}, err
-	}
-
-	// Decode lists (Next and Refs)
-	if entry.Next, err = getStringList(node, "next"); err != nil {
-		return EncodedEntry{}, err
-	}
-	if entry.Refs, err = getStringList(node, "refs"); err != nil {
-		return EncodedEntry{}, err
-	}
-
-	// Calculate the CID for CBOR-encoded bytes
-	hash, err := mh.Sum(encodedData, mh.SHA2_256, -1)
-	if err != nil {
-		return EncodedEntry{}, err
-	}
-	c := cid.NewCidV1(cid.DagCBOR, hash)
-	hashStr, err := c.StringOfBase(multibase.Base58BTC)
-	if err != nil {
-		return EncodedEntry{}, err
-	}
-
-	return EncodedEntry{
-		Entry: entry,
-		Bytes: encodedData,
-		CID:   c,
-		Hash:  hashStr,
-	}, nil
-}
-
-func assembleStringField(ma datamodel.MapAssembler, key string, value string) error {
-	if err := ma.AssembleKey().AssignString(key); err != nil {
-		return err
-	}
-	if err := ma.AssembleValue().AssignString(value); err != nil {
-		return err
-	}
-	return nil
-}
-
-func assembleIntField(ma datamodel.MapAssembler, key string, value int64) error {
-	if err := ma.AssembleKey().AssignString(key); err != nil {
-		return err
-	}
-	if err := ma.AssembleValue().AssignInt(value); err != nil {
-		return err
-	}
-	return nil
-}
-
-func assembleStringList(ma datamodel.MapAssembler, key string, values []string) error {
-	if err := ma.AssembleKey().AssignString(key); err != nil {
-		return err
-	}
-	la, err := ma.AssembleValue().BeginList(int64(len(values)))
-	if err != nil {
-		return err
-	}
-	for _, v := range values {
-		if err := la.AssembleValue().AssignString(v); err != nil {
-			return err
-		}
-	}
-	if err := la.Finish(); err != nil {
-		return err
-	}
-	return nil
-}
-
-func assembleClock(ma datamodel.MapAssembler, key string, clock Clock) error {
-	if err := ma.AssembleKey().AssignString(key); err != nil {
-		return err
-	}
-	ca, err := ma.AssembleValue().BeginMap(2)
-	if err != nil {
-		return err
-	}
-	if err := assembleStringField(ca, "ID", clock.ID); err != nil {
-		return err
-	}
-	if err := assembleIntField(ca, "time", int64(clock.Time)); err != nil {
-		return err
-	}
-	if err := ca.Finish(); err != nil {
-		return err
-	}
-	return nil
-}
-
-func getString(node datamodel.Node, key string) (string, error) {
-	childNode, err := node.LookupByString(key)
-	if err != nil {
-		return "", err
-	}
-	return childNode.AsString()
-}
-
-func getInt(node datamodel.Node, key string) (int64, error) {
-	childNode, err := node.LookupByString(key)
-	if err != nil {
-		return 0, err
-	}
-	return childNode.AsInt()
-}
-
-func getStringList(node datamodel.Node, key string) ([]string, error) {
-	listNode, err := node.LookupByString(key)
+	_, signed, err := block.Encode(entry.signedValue())
 	if err != nil {
 		return nil, err
 	}
-	length := listNode.Length()
-
-	var list []string
-	for i := int64(0); i < length; i++ {
-		itemNode, err := listNode.LookupByIndex(i)
-		if err != nil {
-			return nil, err
-		}
-		str, err := itemNode.AsString()
-		if err != nil {
-			return nil, err
-		}
-		list = append(list, str)
+	sig, err := identity.Sign(ctx, signed)
+	if err != nil {
+		return nil, err
 	}
-	return list, nil
+	entry.Key = identity.PublicKey
+	entry.Identity = identity.Hash
+	entry.Sig = sig
+	return entry, nil
 }
 
-// Helper function to set a default clock if not provided
-func clockOrDefault(clock Clock, identity *identitytypes.Identity) Clock {
-	if clock.ID == "" {
-		return Clock{ID: identity.PublicKey, Time: 1}
+// storedPayload is the payload as it appears in the block.
+func (e *Entry) storedPayload() any {
+	if e.encryptedPayload != nil {
+		return e.encryptedPayload
 	}
-	return clock
+	return e.Payload
+}
+
+// signedValue is the part of the entry the signature covers.
+func (e *Entry) signedValue() map[string]any {
+	return map[string]any{
+		"id":      e.ID,
+		"payload": e.storedPayload(),
+		"next":    nonNil(e.Next),
+		"refs":    nonNil(e.Refs),
+		"clock":   map[string]any{"id": e.Clock.ID, "time": e.Clock.Time},
+		"v":       e.V,
+	}
+}
+
+// VerifyEntry reports whether the entry's signature was made by the key in
+// entry.Key. It does not check that the key belongs to entry.Identity; an
+// access controller does that.
+func VerifyEntry(entry *Entry) (bool, error) {
+	if !IsEntry(entry) {
+		return false, errors.New("invalid log entry")
+	}
+	if entry.Key == "" {
+		return false, errors.New("entry doesn't have a key")
+	}
+	if entry.Sig == "" {
+		return false, errors.New("entry doesn't have a signature")
+	}
+	_, signed, err := block.Encode(entry.signedValue())
+	if err != nil {
+		return false, err
+	}
+	return keystore.VerifyMessage(entry.Sig, entry.Key, signed), nil
+}
+
+// IsEntry reports whether entry has the fields every entry must have.
+func IsEntry(entry *Entry) bool {
+	return entry != nil && entry.ID != "" && entry.Payload != nil && entry.V != 0
+}
+
+// IsEqual reports whether a and b are the same stored entry.
+func IsEqual(a, b *Entry) bool {
+	return a != nil && b != nil && a.Hash != "" && a.Hash == b.Hash
+}
+
+// EncodeEntry returns the hash and bytes of the block entry is stored as.
+func EncodeEntry(ctx context.Context, entry *Entry, enc Encryption) (hash string, data []byte, err error) {
+	value := entry.signedValue()
+	value["key"] = entry.Key
+	value["identity"] = entry.Identity
+	value["sig"] = entry.Sig
+	hash, data, err = block.Encode(value)
+	if err != nil || enc.Replication == nil {
+		return hash, data, err
+	}
+	ciphertext, err := enc.Replication.Encrypt(ctx, data)
+	if err != nil {
+		return "", nil, fmt.Errorf("encrypt entry: %w", err)
+	}
+	return block.Encode(ciphertext)
+}
+
+// DecodeEntry parses an entry block, decrypting it if enc says so. The
+// returned entry's Hash is the CID of data.
+func DecodeEntry(ctx context.Context, data []byte, enc Encryption) (*Entry, error) {
+	hash, err := block.Hash(data)
+	if err != nil {
+		return nil, err
+	}
+	stored := data
+	if enc.Replication != nil {
+		v, err := block.Decode(data)
+		if err != nil {
+			return nil, err
+		}
+		ciphertext, ok := v.([]byte)
+		if !ok {
+			return nil, errors.New("could not decrypt entry: block is not a byte string")
+		}
+		if data, err = enc.Replication.Decrypt(ctx, ciphertext); err != nil {
+			return nil, fmt.Errorf("could not decrypt entry: %w", err)
+		}
+	}
+	v, err := block.Decode(data)
+	if err != nil {
+		return nil, err
+	}
+	m, err := block.Map(v)
+	if err != nil {
+		return nil, err
+	}
+	entry, err := entryFromMap(m)
+	if err != nil {
+		return nil, fmt.Errorf("entry %s: %w", hash, err)
+	}
+	if enc.Data != nil {
+		ciphertext, ok := entry.Payload.([]byte)
+		if !ok {
+			return nil, errors.New("could not decrypt payload: payload is not a byte string")
+		}
+		plain, err := enc.Data.Decrypt(ctx, ciphertext)
+		if err != nil {
+			return nil, fmt.Errorf("could not decrypt payload: %w", err)
+		}
+		if entry.Payload, err = block.Decode(plain); err != nil {
+			return nil, fmt.Errorf("could not decrypt payload: %w", err)
+		}
+		entry.encryptedPayload = ciphertext
+	}
+	entry.Hash = hash
+	entry.block = stored
+	return entry, nil
+}
+
+func entryFromMap(m map[string]any) (*Entry, error) {
+	var (
+		e   Entry
+		err error
+	)
+	if e.ID, err = block.String(m, "id"); err != nil {
+		return nil, err
+	}
+	payload, ok := m["payload"]
+	if !ok {
+		return nil, errors.New(`missing field "payload"`)
+	}
+	e.Payload = payload
+	if e.Next, err = block.Strings(m, "next"); err != nil {
+		return nil, err
+	}
+	if e.Refs, err = block.Strings(m, "refs"); err != nil {
+		return nil, err
+	}
+	clock, err := block.Map(m["clock"])
+	if err != nil {
+		return nil, fmt.Errorf("clock: %w", err)
+	}
+	if e.Clock.ID, err = block.String(clock, "id"); err != nil {
+		return nil, fmt.Errorf("clock: %w", err)
+	}
+	if e.Clock.Time, err = block.Int(clock, "time"); err != nil {
+		return nil, fmt.Errorf("clock: %w", err)
+	}
+	if e.V, err = block.Int(m, "v"); err != nil {
+		return nil, err
+	}
+	// key, identity and sig are checked by verification, not decoding.
+	e.Key, _ = m["key"].(string)
+	e.Identity, _ = m["identity"].(string)
+	e.Sig, _ = m["sig"].(string)
+	return &e, nil
+}
+
+func nonNil(s []string) []string {
+	if s == nil {
+		return []string{}
+	}
+	return s
 }

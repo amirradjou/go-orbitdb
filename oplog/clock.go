@@ -1,36 +1,38 @@
 package oplog
 
+import "strings"
+
+// Clock is a Lamport clock. ID is the public key of the writer that
+// produced the entry, Time its logical time.
 type Clock struct {
-	ID   string `json:"id"`
-	Time int    `json:"time"`
+	ID   string
+	Time int64
 }
 
-func NewClock(id string, time int) Clock {
-	return Clock{
-		ID:   id,
-		Time: time,
-	}
+// NewClock returns a clock with the given id and time.
+func NewClock(id string, time int64) Clock {
+	return Clock{ID: id, Time: time}
 }
 
-func CompareClocks(a Clock, b Clock) (res int) {
+// CompareClocks orders clocks by time and, for concurrent clocks with
+// different ids, by id. The result is negative when a is less than b and
+// positive when it is greater; it is zero only when a and b are the same
+// clock.
+func CompareClocks(a, b Clock) int {
 	dist := a.Time - b.Time
-	res = dist
-
 	if dist == 0 && a.ID != b.ID {
-		if a.ID < b.ID {
-			res = -1
-		} else {
-			res = 1
-		}
+		return strings.Compare(a.ID, b.ID)
 	}
-
-	return
+	switch {
+	case dist < 0:
+		return -1
+	case dist > 0:
+		return 1
+	}
+	return 0
 }
 
+// TickClock returns c advanced by one.
 func TickClock(c Clock) Clock {
 	return Clock{ID: c.ID, Time: c.Time + 1}
-}
-
-func (c *Clock) Tick() {
-	c.Time += 1
 }

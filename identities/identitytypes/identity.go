@@ -1,214 +1,150 @@
+// Package identitytypes defines the Identity record that signs OrbitDB log
+// entries, and its dag-cbor encoding.
+//
+// It mirrors src/identities/identity.js in @orbitdb/core: an identity is the
+// block {id, publicKey, signatures: {id, publicKey}, type}, addressed by the
+// base58btc CID of its dag-cbor bytes.
 package identitytypes
 
 import (
-	"bytes"
+	"context"
 	"errors"
-	"fmt"
-	"github.com/ipfs/go-cid"
-	"github.com/ipld/go-ipld-prime"
-	"github.com/ipld/go-ipld-prime/codec/dagcbor"
-	"github.com/ipld/go-ipld-prime/node/basicnode"
-	"github.com/multiformats/go-multibase"
-	mh "github.com/multiformats/go-multihash"
+
+	"github.com/orbitdb/go-orbitdb/internal/block"
 )
 
-// Identity represents a basic identity structure.
+// Signatures are the two signatures that bind an identity together.
+type Signatures struct {
+	// ID is the signature of the identity id by the identity's signing key
+	// (the key behind PublicKey).
+	ID string
+	// PublicKey is the signature of PublicKey+Signatures.ID by the key the
+	// identity provider vouches for (for the publickey provider, the key
+	// whose public key is the identity id).
+	PublicKey string
+}
+
+// Signer signs data on behalf of an identity. Identities implements it.
+type Signer interface {
+	Sign(ctx context.Context, identity *Identity, data []byte) (string, error)
+}
+
+// Identity is an OrbitDB identity.
 type Identity struct {
-	ID         string            // Unique ID for the identity
-	PublicKey  string            // Hex representation of the public key
-	Hash       string            // Hash of the identity (ID + PublicKey)
-	Signatures map[string]string // Signatures for id and publicKey
-	Bytes      []byte            // Encoded byte representation of the identity
+	ID         string
+	PublicKey  string
+	Signatures Signatures
 	Type       string
+
+	// Hash is the base58btc CID of Bytes.
+	Hash string
+	// Bytes is the dag-cbor encoding of the identity.
+	Bytes []byte
+
+	signer Signer
 }
 
-// EncodedIdentity represents an Identity that has been encoded.
-type EncodedIdentity struct {
-	Identity Identity
-	Bytes    []byte
-	CID      cid.Cid
-	Hash     string
+// New validates the fields and returns an encoded identity. signer may be
+// nil for identities that are only verified, never used to sign (for
+// example identities decoded from peers).
+func New(id, publicKey string, signatures Signatures, typ string, signer Signer) (*Identity, error) {
+	switch {
+	case id == "":
+		return nil, errors.New("identity id is required")
+	case publicKey == "":
+		return nil, errors.New("invalid public key")
+	case signatures.ID == "":
+		return nil, errors.New("signature of id is required")
+	case signatures.PublicKey == "":
+		return nil, errors.New("signature of publicKey+id is required")
+	case typ == "":
+		return nil, errors.New("identity type is required")
+	}
+	identity := &Identity{
+		ID:         id,
+		PublicKey:  publicKey,
+		Signatures: signatures,
+		Type:       typ,
+		signer:     signer,
+	}
+	hash, data, err := Encode(identity)
+	if err != nil {
+		return nil, err
+	}
+	identity.Hash = hash
+	identity.Bytes = data
+	return identity, nil
 }
 
-// IsIdentity Checks if an identity has all required fields populated.
+// Encode returns the hash and dag-cbor bytes of identity.
+func Encode(identity *Identity) (hash string, data []byte, err error) {
+	return block.Encode(map[string]any{
+		"id":        identity.ID,
+		"publicKey": identity.PublicKey,
+		"signatures": map[string]any{
+			"id":        identity.Signatures.ID,
+			"publicKey": identity.Signatures.PublicKey,
+		},
+		"type": identity.Type,
+	})
+}
+
+// Decode parses an identity block. The result has no signer.
+func Decode(data []byte) (*Identity, error) {
+	v, err := block.Decode(data)
+	if err != nil {
+		return nil, err
+	}
+	m, err := block.Map(v)
+	if err != nil {
+		return nil, err
+	}
+	sigs, err := block.Map(m["signatures"])
+	if err != nil {
+		return nil, errors.New("identity: signatures object is required")
+	}
+	// Missing fields decode as "" and are reported by New's validation.
+	id, _ := m["id"].(string)
+	publicKey, _ := m["publicKey"].(string)
+	typ, _ := m["type"].(string)
+	idSig, _ := sigs["id"].(string)
+	pkSig, _ := sigs["publicKey"].(string)
+	return New(id, publicKey, Signatures{ID: idSig, PublicKey: pkSig}, typ, nil)
+}
+
+// Sign signs data with the identity's private key.
+func (i *Identity) Sign(ctx context.Context, data []byte) (string, error) {
+	if i.signer == nil {
+		return "", errors.New("identity cannot sign: it has no signer")
+	}
+	return i.signer.Sign(ctx, i, data)
+}
+
+// WithSigner returns a copy of i that signs through signer.
+func (i *Identity) WithSigner(signer Signer) *Identity {
+	c := *i
+	c.signer = signer
+	return &c
+}
+
+// IsIdentity reports whether every field of identity is set.
 func IsIdentity(identity *Identity) bool {
 	return identity != nil &&
 		identity.ID != "" &&
 		identity.Hash != "" &&
-		identity.Bytes != nil &&
+		len(identity.Bytes) > 0 &&
 		identity.PublicKey != "" &&
-		identity.Signatures != nil &&
-		identity.Signatures["id"] != "" &&
-		identity.Signatures["publicKey"] != "" &&
+		identity.Signatures.ID != "" &&
+		identity.Signatures.PublicKey != "" &&
 		identity.Type != ""
 }
 
-// IsEqual Checks if two identities are identical based on key properties.
+// IsEqual reports whether a and b are the same identity.
 func IsEqual(a, b *Identity) bool {
-	if a == nil || b == nil {
-		fmt.Println("One of the identities is nil.")
-		return false
-	}
-
-	equal := true
-
-	if a.ID != b.ID {
-		fmt.Printf("IDs are not equal: a.ID = %v, b.ID = %v\n", a.ID, b.ID)
-		equal = false
-	}
-
-	if a.PublicKey != b.PublicKey {
-		fmt.Printf("Public keys are not equal: a.PublicKey = %v, b.PublicKey = %v\n", a.PublicKey, b.PublicKey)
-		equal = false
-	}
-	if a.Signatures["id"] != b.Signatures["id"] {
-		fmt.Printf("Signatures for 'id' are not equal: a.Signatures[\"id\"] = %v, b.Signatures[\"id\"] = %v\n", a.Signatures["id"], b.Signatures["id"])
-		equal = false
-	}
-	if a.Signatures["publicKey"] != b.Signatures["publicKey"] {
-		fmt.Printf("Signatures for 'publicKey' are not equal: a.Signatures[\"publicKey\"] = %v, b.Signatures[\"publicKey\"] = %v\n", a.Signatures["publicKey"], b.Signatures["publicKey"])
-		equal = false
-	}
-
-	if a.Hash != b.Hash {
-		fmt.Printf("Hashes are not equal: a.Hash = %v, b.Hash = %v\n", a.Hash, b.Hash)
-		equal = false
-	}
-
-	return equal
-}
-
-// EncodeIdentity encodes an Identity instance into CBOR format and returns hash, bytes, and error.
-func EncodeIdentity(identity Identity) (string, []byte, error) {
-	// Initialize a basic map node for encoding with canonical field order
-	nb := basicnode.Prototype__Map{}.NewBuilder()
-	ma, _ := nb.BeginMap(4)
-
-	// Assemble fields in a consistent order
-	ma.AssembleKey().AssignString("id")
-	ma.AssembleValue().AssignString(identity.ID)
-
-	ma.AssembleKey().AssignString("publicKey")
-	ma.AssembleValue().AssignString(identity.PublicKey)
-
-	ma.AssembleKey().AssignString("signatures")
-	sigMap, _ := ma.AssembleValue().BeginMap(int64(len(identity.Signatures)))
-	for k, v := range identity.Signatures {
-		sigMap.AssembleKey().AssignString(k)
-		sigMap.AssembleValue().AssignString(v)
-	}
-	sigMap.Finish()
-
-	ma.AssembleKey().AssignString("type")
-	ma.AssembleValue().AssignString(identity.Type)
-
-	ma.Finish()
-
-	// Build the node and encode to CBOR
-	node := nb.Build()
-	var buf bytes.Buffer
-	if err := dagcbor.Encode(node, &buf); err != nil {
-		return "", nil, err
-	}
-
-	// Calculate CID for CBOR-encoded bytes
-	hash, err := mh.Sum(buf.Bytes(), mh.SHA2_256, -1)
-	if err != nil {
-		return "", nil, err
-	}
-	c := cid.NewCidV1(cid.DagCBOR, hash)
-
-	// Encode CID to base58btc for hash string
-	hashStr, err := c.StringOfBase(multibase.Base58BTC)
-	if err != nil {
-		return "", nil, err
-	}
-
-	return hashStr, buf.Bytes(), nil
-}
-
-// DecodeIdentity decodes CBOR-encoded bytes back into an Identity struct.
-func DecodeIdentity(encodedData []byte) (*Identity, error) {
-	// Check if the encodedData is empty
-	if len(encodedData) == 0 {
-		return nil, errors.New("invalid or empty input data")
-	}
-
-	// Create a node for decoding
-	nb := basicnode.Prototype__Map{}.NewBuilder()
-	buf := bytes.NewReader(encodedData)
-
-	// Decode CBOR data
-	if err := dagcbor.Decode(nb, buf); err != nil {
-		return nil, err
-	}
-	node := nb.Build()
-
-	// Extract fields to reconstruct the Identity
-	identity := Identity{}
-
-	// Validate and set 'id' field
-	if idNode, err := node.LookupByString("id"); err == nil {
-		id, err := idNode.AsString()
-		if err != nil || id == "" {
-			return nil, errors.New("invalid or missing 'id' field")
-		}
-		identity.ID = id
-	} else {
-		return nil, errors.New("invalid or missing 'id' field")
-	}
-
-	// Validate and set 'publicKey' field
-	if publicKeyNode, err := node.LookupByString("publicKey"); err == nil {
-		publicKey, err := publicKeyNode.AsString()
-		if err != nil || publicKey == "" {
-			return nil, errors.New("invalid or missing 'publicKey' field")
-		}
-		identity.PublicKey = publicKey
-	} else {
-		return nil, errors.New("invalid or missing 'publicKey' field")
-	}
-
-	// Validate and set 'signatures' field as a map
-	if sigNode, err := node.LookupByString("signatures"); err == nil {
-		if sigNode.Kind() != ipld.Kind_Map {
-			return nil, errors.New("invalid or missing 'signatures' field")
-		}
-		sigMap := make(map[string]string)
-
-		// Iterate over map keys to ensure each signature is a string
-		iter := sigNode.MapIterator()
-		for !iter.Done() {
-			keyNode, valueNode, _ := iter.Next()
-			key, err := keyNode.AsString()
-			if err != nil {
-				return nil, errors.New("invalid key format in 'signatures'")
-			}
-			val, err := valueNode.AsString()
-			if err != nil {
-				return nil, errors.New("invalid signature format")
-			}
-			sigMap[key] = val
-		}
-		identity.Signatures = sigMap
-	} else {
-		return nil, errors.New("invalid or missing 'signatures' field")
-	}
-
-	// Validate and set 'type' field
-	if typeNode, err := node.LookupByString("type"); err == nil {
-		identityType, err := typeNode.AsString()
-		if err != nil || identityType == "" {
-			return nil, errors.New("invalid or missing 'type' field")
-		}
-		identity.Type = identityType
-	} else {
-		return nil, errors.New("invalid or missing 'type' field")
-	}
-
-	hash, encodedBytes, _ := EncodeIdentity(identity)
-	identity.Hash = hash
-	identity.Bytes = encodedBytes
-
-	return &identity, nil
+	return a != nil && b != nil &&
+		a.ID == b.ID &&
+		a.Hash == b.Hash &&
+		a.Type == b.Type &&
+		a.PublicKey == b.PublicKey &&
+		a.Signatures == b.Signatures
 }

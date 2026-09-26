@@ -1,167 +1,136 @@
 package databases
 
 import (
-	"encoding/json"
+	"context"
 	"errors"
 	"fmt"
-	pubsub "github.com/libp2p/go-libp2p-pubsub"
-	"github.com/libp2p/go-libp2p/core/host"
-	"orbitdb/go-orbitdb/identities/identitytypes"
-	"orbitdb/go-orbitdb/keystore"
-	"orbitdb/go-orbitdb/storage"
+	"iter"
+	"slices"
 )
 
-// KeyValue extends the base Database with key-value functionality.
+// KeyValueType is the type name of KeyValue databases.
+const KeyValueType = "keyvalue"
+
+// KeyValue is a key/value store. Reads walk the log from the heads, so the
+// latest write to a key wins; KeyValueIndexed keeps an index instead.
 type KeyValue struct {
 	*Database
 }
 
-// NewKeyValue creates a new KeyValue database instance.
-func NewKeyValue(address, name string, identity *identitytypes.Identity, entryStorage storage.Storage, keyStore *keystore.KeyStore, host host.Host, ps *pubsub.PubSub) (*KeyValue, error) {
-	// Ensure required parameters are provided
-	if host == nil || ps == nil {
-		return nil, errors.New("host and pubsub instances are required")
-	}
-
-	// Initialize the base database
-	baseDB, err := NewDatabase(address, name, identity, entryStorage, keyStore, host, ps)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create base database: %w", err)
-	}
-	return &KeyValue{Database: baseDB}, nil
+// KeyValueEntry is a key, its value and the hash of the entry that set it.
+type KeyValueEntry struct {
+	Key   string
+	Value any
+	Hash  string
 }
 
-// Put adds or updates a key-value pair.
-func (kv *KeyValue) Put(key string, value interface{}) (string, error) {
+// NewKeyValue opens a KeyValue database.
+func NewKeyValue(ctx context.Context, p Params) (*KeyValue, error) {
+	db, err := New(ctx, p)
+	if err != nil {
+		return nil, err
+	}
+	return &KeyValue{Database: db}, nil
+}
+
+// Type returns KeyValueType.
+func (*KeyValue) Type() string { return KeyValueType }
+
+// Put sets key to value and returns the hash of the entry.
+func (kv *KeyValue) Put(ctx context.Context, key string, value any) (string, error) {
 	if key == "" {
-		return "", errors.New("key cannot be empty")
+		return "", errors.New("key is required")
 	}
-
-	op := map[string]interface{}{
-		"op":    "PUT",
-		"key":   key,
-		"value": value,
-	}
-
-	payload, err := json.Marshal(op)
-	if err != nil {
-		return "", fmt.Errorf("failed to serialize operation: %w", err)
-	}
-
-	return kv.AddOperation(string(payload))
+	return kv.AddOperation(ctx, Operation{Op: "PUT", Key: key, Value: value}.payload())
 }
 
-// Get retrieves the value for a given key.
-func (kv *KeyValue) Get(key string) (interface{}, error) {
-	entries, err := kv.Log.Values()
-	if err != nil {
-		return nil, fmt.Errorf("failed to retrieve log entries: %w", err)
-	}
-
-	// Traverse log entries in reverse order (most recent first)
-	for i := len(entries) - 1; i >= 0; i-- {
-		entry := entries[i]
-
-		// Decode the outer JSON-encoded payload string
-		var rawPayload string
-		err := json.Unmarshal([]byte(entry.Payload), &rawPayload)
-		if err != nil {
-			fmt.Printf("Warning: Failed to decode outer payload for entry %s: %v\n", entry.Hash, err)
-			continue
-		}
-
-		// Decode the inner JSON string into a map
-		var payload map[string]interface{}
-		err = json.Unmarshal([]byte(rawPayload), &payload)
-		if err != nil {
-			fmt.Printf("Warning: Failed to decode inner payload for entry %s: %v\n", entry.Hash, err)
-			continue
-		}
-
-		op, ok := payload["op"].(string)
-		entryKey, _ := payload["key"].(string)
-		if !ok || entryKey != key {
-			continue
-		}
-
-		// Handle the operation
-		if op == "PUT" {
-			return payload["value"], nil
-		} else if op == "DEL" {
-			return nil, nil
-		}
-	}
-
-	// If the key is not found, return nil
-	return nil, nil
+// Set is an alias for Put.
+func (kv *KeyValue) Set(ctx context.Context, key string, value any) (string, error) {
+	return kv.Put(ctx, key, value)
 }
 
-// Del removes a key-value pair.
-func (kv *KeyValue) Del(key string) (string, error) {
+// Del deletes key and returns the hash of the entry.
+func (kv *KeyValue) Del(ctx context.Context, key string) (string, error) {
 	if key == "" {
-		return "", errors.New("key cannot be empty")
+		return "", errors.New("key is required")
 	}
-
-	op := map[string]interface{}{
-		"op":  "DEL",
-		"key": key,
-	}
-
-	payload, err := json.Marshal(op)
-	if err != nil {
-		return "", fmt.Errorf("failed to serialize operation: %w", err)
-	}
-
-	return kv.AddOperation(string(payload))
+	return kv.AddOperation(ctx, Operation{Op: "DEL", Key: key, Value: nil}.payload())
 }
 
-// All retrieves all key-value pairs in the database.
-func (kv *KeyValue) All() (map[string]interface{}, error) {
-	entries, err := kv.Log.Values()
-	if err != nil {
-		return nil, fmt.Errorf("failed to retrieve log entries: %w", err)
-	}
-
-	result := make(map[string]interface{})
-	processedKeys := make(map[string]bool)
-
-	// Traverse log entries in reverse order (most recent first)
-	for i := len(entries) - 1; i >= 0; i-- {
-		entry := entries[i]
-
-		// Decode the outer JSON-encoded payload string
-		var rawPayload string
-		err := json.Unmarshal([]byte(entry.Payload), &rawPayload)
+// Get returns the value of key, or an error wrapping ErrNotFound if the key
+// was never set or was deleted.
+func (kv *KeyValue) Get(ctx context.Context, key string) (any, error) {
+	for entry, err := range kv.log.Traverse(ctx, nil, nil) {
 		if err != nil {
-			fmt.Printf("Warning: Failed to decode outer payload for entry %s: %v\n", entry.Hash, err)
+			return nil, err
+		}
+		op, ok := ParseOperation(entry.Payload)
+		if !ok {
 			continue
 		}
-
-		// Decode the inner JSON string into a map
-		var payload map[string]interface{}
-		err = json.Unmarshal([]byte(rawPayload), &payload)
-		if err != nil {
-			fmt.Printf("Warning: Failed to decode inner payload for entry %s: %v\n", entry.Hash, err)
+		if k, _ := op.Key.(string); k != key {
 			continue
 		}
-
-		op, ok := payload["op"].(string)
-		key, _ := payload["key"].(string)
-		value, _ := payload["value"].(interface{})
-
-		// If the key has already been processed, skip it
-		if processedKeys[key] {
-			continue
+		switch op.Op {
+		case "PUT":
+			return op.Value, nil
+		case "DEL":
+			return nil, fmt.Errorf("%w: %s", ErrNotFound, key)
 		}
-
-		if ok && op == "PUT" {
-			result[key] = value
-		} else if op == "DEL" {
-			delete(result, key)
-		}
-
-		processedKeys[key] = true
 	}
+	return nil, fmt.Errorf("%w: %s", ErrNotFound, key)
+}
 
-	return result, nil
+// Iterator yields the current value of every key, most recently written
+// first. amount limits the number of keys; zero or negative means all.
+func (kv *KeyValue) Iterator(ctx context.Context, amount int) iter.Seq2[KeyValueEntry, error] {
+	return func(yield func(KeyValueEntry, error) bool) {
+		seen := make(map[string]bool)
+		count := 0
+		for entry, err := range kv.log.Traverse(ctx, nil, nil) {
+			if err != nil {
+				yield(KeyValueEntry{}, err)
+				return
+			}
+			op, ok := ParseOperation(entry.Payload)
+			if !ok {
+				continue
+			}
+			key, ok := keyString(op.Key)
+			if !ok || seen[key] {
+				continue
+			}
+			switch op.Op {
+			case "PUT":
+				seen[key] = true
+				count++
+				if !yield(KeyValueEntry{Key: key, Value: op.Value, Hash: entry.Hash}, nil) {
+					return
+				}
+			case "DEL":
+				seen[key] = true
+			}
+			if amount > 0 && count >= amount {
+				return
+			}
+		}
+	}
+}
+
+// All returns every key and its current value, least recently written
+// first.
+func (kv *KeyValue) All(ctx context.Context) ([]KeyValueEntry, error) {
+	return collectReversed(kv.Iterator(ctx, 0))
+}
+
+func collectReversed[T any](seq iter.Seq2[T, error]) ([]T, error) {
+	var out []T
+	for v, err := range seq {
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, v)
+	}
+	slices.Reverse(out)
+	return out, nil
 }

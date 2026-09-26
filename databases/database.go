@@ -1,244 +1,342 @@
+// Package databases implements the OrbitDB database types on top of the
+// operation log: Events (an append-only event log), KeyValue,
+// KeyValueIndexed and Documents.
+//
+// It mirrors src/database.js and src/databases in @orbitdb/core 4.
+// Operations are stored as the same {op, key, value} payloads, so a
+// database written by one implementation reads the same in the other.
 package databases
 
 import (
-	"encoding/json"
+	"context"
 	"errors"
 	"fmt"
-	pubsub "github.com/libp2p/go-libp2p-pubsub"
-	"github.com/libp2p/go-libp2p/core/host"
-	"orbitdb/go-orbitdb/identities/identitytypes"
-	"orbitdb/go-orbitdb/keystore"
-	"orbitdb/go-orbitdb/oplog"
-	"orbitdb/go-orbitdb/storage"
-	orbitsync "orbitdb/go-orbitdb/syncutils"
+	"path/filepath"
 	"sync"
+
+	"github.com/libp2p/go-libp2p/core/peer"
+
+	"github.com/orbitdb/go-orbitdb/identities/identitytypes"
+	"github.com/orbitdb/go-orbitdb/ipfs"
+	"github.com/orbitdb/go-orbitdb/oplog"
+	"github.com/orbitdb/go-orbitdb/storage"
+	"github.com/orbitdb/go-orbitdb/syncutils"
 )
 
-// Database represents the base class for all database types.
-type Database struct {
-	Address     string
-	Name        string
-	Identity    *identitytypes.Identity
-	Meta        map[string]interface{}
-	Log         *oplog.Log
-	Sync        *orbitsync.Sync
-	Events      chan interface{}
-	taskQueue   chan func()
-	stopChannel chan struct{}
-	mu          sync.Mutex
+const (
+	// DefaultReferencesCount is how many older entries each new entry
+	// refers to, beyond the heads.
+	DefaultReferencesCount = 16
+	// DefaultDirectory is where databases keep their files.
+	DefaultDirectory = "./orbitdb"
+
+	cacheSize = 1000
+)
+
+// ErrNotFound is returned when a key, document or event does not exist.
+var ErrNotFound = errors.New("databases: not found")
+
+// Params configures a database. OrbitDB.Open fills it; it is exported for
+// custom database types and for using a database without OrbitDB.
+type Params struct {
+	// IPFS provides block storage and networking. Required unless every
+	// storage is given and sync is disabled.
+	IPFS *ipfs.Node
+	// Identity writes to the database. Required.
+	Identity *identitytypes.Identity
+	// Address is the database address; it is also the log id and the sync
+	// topic. Required.
+	Address string
+	Name    string
+	// AccessController decides who may write. Defaults to anyone.
+	AccessController oplog.AccessController
+	// Directory holds the database files, under Directory/<address>.
+	// Defaults to DefaultDirectory.
+	Directory string
+	// Meta is the manifest metadata.
+	Meta any
+	// EntryStorage defaults to an LRU cache over IPFS block storage;
+	// HeadsStorage and IndexStorage to an LRU cache over LevelDB in
+	// Directory.
+	HeadsStorage storage.Storage
+	EntryStorage storage.Storage
+	IndexStorage storage.Storage
+	// ReferencesCount is passed to Log.Append. Zero means
+	// DefaultReferencesCount; negative means no references.
+	ReferencesCount int
+	// DisableAutoSync leaves sync stopped until Sync().Start() is called.
+	DisableAutoSync bool
+	// OnUpdate is called, before EventUpdate is emitted, for every entry
+	// appended or joined.
+	OnUpdate func(ctx context.Context, log *oplog.Log, entry *oplog.Entry) error
+	// OnClose is called once the database has closed.
+	OnClose func()
+	// Encryption turns on entry and/or payload encryption.
+	Encryption oplog.Encryption
 }
 
-// NewDatabase creates a new Database instance.
-func NewDatabase(
-	address, name string,
-	identity *identitytypes.Identity,
-	entryStorage storage.Storage,
-	keyStore *keystore.KeyStore,
-	host host.Host,
-	pubsub *pubsub.PubSub,
-) (*Database, error) {
-	// Validate inputs
-	if address == "" {
-		return nil, fmt.Errorf("address is required")
+// Database is the base every database type builds on: an operation log, the
+// sync protocol replicating it and an event stream.
+type Database struct {
+	address  string
+	name     string
+	identity *identitytypes.Identity
+	meta     any
+	log      *oplog.Log
+	sync     *syncutils.Sync
+	events   *Emitter
+	access   oplog.AccessController
+
+	referencesCount int
+	onUpdate        func(context.Context, *oplog.Log, *oplog.Entry) error
+	onClose         func()
+
+	// mu serialises operations, like the p-queue of @orbitdb/core.
+	mu        sync.Mutex
+	closeOnce sync.Once
+	closeErr  error
+}
+
+// New opens the base database. Database types call it and add their
+// operations on top.
+func New(ctx context.Context, p Params) (*Database, error) {
+	if p.Identity == nil {
+		return nil, errors.New("databases: an identity is required")
+	}
+	if p.Address == "" {
+		return nil, errors.New("databases: an address is required")
+	}
+	dir := p.Directory
+	if dir == "" {
+		dir = DefaultDirectory
+	}
+	dir = filepath.Join(dir, filepath.FromSlash(p.Address))
+
+	refs := p.ReferencesCount
+	switch {
+	case refs == 0:
+		refs = DefaultReferencesCount
+	case refs < 0:
+		refs = 0
 	}
 
-	// Validate identity
-	if identity == nil || !identitytypes.IsIdentity(identity) {
-		return nil, fmt.Errorf("valid identity is required")
+	var err error
+	entries := p.EntryStorage
+	if entries == nil {
+		if p.IPFS == nil {
+			return nil, errors.New("databases: IPFS is required for the default entry storage")
+		}
+		if entries, err = cachedIPFS(p.IPFS); err != nil {
+			return nil, err
+		}
+	}
+	heads := p.HeadsStorage
+	if heads == nil {
+		if heads, err = cachedLevel(filepath.Join(dir, "log", "_heads")); err != nil {
+			return nil, err
+		}
+	}
+	index := p.IndexStorage
+	if index == nil {
+		if index, err = cachedLevel(filepath.Join(dir, "log", "_index")); err != nil {
+			_ = heads.Close()
+			return nil, err
+		}
 	}
 
-	// Use default in-memory storage if no entryStorage is provided
-	if entryStorage == nil {
-		entryStorage = storage.NewMemoryStorage()
-	}
-
-	// Use default in-memory KeyStore if no keyStore is provided
-	if keyStore == nil {
-		keyStore = keystore.NewKeyStore(storage.NewMemoryStorage())
-	}
-
-	// Initialize the log
-	log, err := oplog.NewLog(address, identity, entryStorage, keyStore)
+	log, err := oplog.NewLog(ctx, p.Identity, oplog.Options{
+		LogID:            p.Address,
+		AccessController: p.AccessController,
+		EntryStorage:     entries,
+		HeadsStorage:     heads,
+		IndexStorage:     index,
+		Encryption:       p.Encryption,
+	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to initialize oplog: %w", err)
+		return nil, err
 	}
 
-	// Initialize the database instance
 	db := &Database{
-		Address:     address,
-		Name:        name,
-		Identity:    identity,
-		Meta:        make(map[string]interface{}),
-		Log:         log,
-		Events:      make(chan interface{}, 100),
-		taskQueue:   make(chan func(), 100),
-		stopChannel: make(chan struct{}),
+		address:         p.Address,
+		name:            p.Name,
+		identity:        p.Identity,
+		meta:            p.Meta,
+		log:             log,
+		events:          newEmitter(),
+		access:          p.AccessController,
+		referencesCount: refs,
+		onUpdate:        p.OnUpdate,
+		onClose:         p.OnClose,
 	}
-
-	// Start processing the task queue
-	go db.processTaskQueue()
-
-	// Initialize Sync with the provided host and pubsub
-	db.Sync = orbitsync.NewSync(host, pubsub, log)
-	err = db.Sync.Start()
+	if p.IPFS == nil {
+		if !p.DisableAutoSync {
+			_ = log.Close()
+			return nil, errors.New("databases: IPFS is required to sync")
+		}
+		return db, nil
+	}
+	db.sync, err = syncutils.New(syncutils.Options{
+		Host:     p.IPFS.Host,
+		PubSub:   p.IPFS.PubSub,
+		Log:      log,
+		OnSynced: db.applyOperation,
+		OnJoin: func(id peer.ID, heads []*oplog.Entry) {
+			db.events.emit(Event{Type: EventJoin, Peer: id, Heads: heads})
+		},
+		OnLeave: func(id peer.ID) {
+			db.events.emit(Event{Type: EventLeave, Peer: id})
+		},
+		OnError: func(err error) {
+			db.events.emit(Event{Type: EventError, Err: err})
+		},
+		DisableAutoStart: p.DisableAutoSync,
+	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to start sync: %w", err)
+		_ = log.Close()
+		return nil, err
 	}
-
-	// Listen for synchronized entries
-	go db.listenForSyncUpdates()
-
 	return db, nil
 }
 
-// processTaskQueue processes tasks sequentially from the task queue.
-func (db *Database) processTaskQueue() {
-	for {
-		select {
-		case task := <-db.taskQueue:
-			task()
-		case <-db.stopChannel:
-			return
-		}
-	}
-}
-
-// listenForSyncUpdates listens to updates from the Sync component.
-func (db *Database) listenForSyncUpdates() {
-	for synced := range db.Sync.SyncedCh {
-		db.ApplyOperation(synced.Entry.Bytes)
-	}
-}
-
-// AddOperation appends a new operation to the log.
-func (db *Database) AddOperation(op interface{}) (string, error) {
-	// Serialize the operation to a string
-	payload, err := serializeOperation(op)
+func cachedIPFS(node *ipfs.Node) (storage.Storage, error) {
+	blocks, err := storage.NewIPFSBlockStorage(node.Blocks, storage.IPFSBlockStorageOptions{Pinner: node.Pins})
 	if err != nil {
-		return "", fmt.Errorf("failed to serialize operation: %w", err)
+		return nil, err
 	}
-
-	// Create a result channel for hash and error
-	resultChan := make(chan struct {
-		hash string
-		err  error
-	}, 1)
-
-	// Define the task
-	task := func() {
-		var result struct {
-			hash string
-			err  error
-		}
-
-		// Append the operation to the log
-		entry, err := db.Log.Append(payload)
-		if err != nil {
-			result.err = fmt.Errorf("failed to append to log: %w", err)
-			resultChan <- result
-			return
-		}
-
-		// Add the entry to sync
-		if syncErr := db.Sync.Add(entry.Payload); syncErr != nil {
-			result.err = fmt.Errorf("failed to sync entry: %w", syncErr)
-			resultChan <- result
-			return
-		}
-
-		// Emit the update event safely
-		select {
-		case db.Events <- entry:
-		default:
-			// Log or handle the case where Events channel is full
-			fmt.Println("warning: Events channel full, event dropped")
-		}
-
-		// Return the hash
-		result.hash = entry.Hash
-		resultChan <- result
-	}
-
-	// Add the task to the queue
-	db.taskQueue <- task
-
-	// Wait for the task result
-	result := <-resultChan
-	return result.hash, result.err
+	return cached(blocks)
 }
 
-// serializeOperation serializes the operation to a JSON string.
-func serializeOperation(op interface{}) (string, error) {
-	if op == nil {
-		return "", errors.New("operation cannot be nil")
-	}
-
-	bytes, err := json.Marshal(op)
+func cachedLevel(path string) (storage.Storage, error) {
+	level, err := storage.NewLevelStorage(path)
 	if err != nil {
-		return "", fmt.Errorf("failed to serialize operation: %w", err)
+		return nil, err
 	}
-
-	return string(bytes), nil
+	return cached(level)
 }
 
-// Close stops the database's operations and cleans up resources.
+func cached(s storage.Storage) (storage.Storage, error) {
+	lru, err := storage.NewLRUStorage(cacheSize)
+	if err != nil {
+		return nil, err
+	}
+	return storage.NewComposedStorage(lru, s), nil
+}
+
+// Address returns the database address.
+func (db *Database) Address() string { return db.address }
+
+// Name returns the database name.
+func (db *Database) Name() string { return db.name }
+
+// Identity returns the identity the database writes as.
+func (db *Database) Identity() *identitytypes.Identity { return db.identity }
+
+// Meta returns the manifest metadata.
+func (db *Database) Meta() any { return db.meta }
+
+// Log returns the operation log.
+func (db *Database) Log() *oplog.Log { return db.log }
+
+// Sync returns the sync protocol instance, or nil if the database has no
+// IPFS node.
+func (db *Database) Sync() *syncutils.Sync { return db.sync }
+
+// Peers returns the peers currently replicating the database.
+func (db *Database) Peers() []peer.ID {
+	if db.sync == nil {
+		return nil
+	}
+	return db.sync.Peers()
+}
+
+// Events returns the database's event emitter.
+func (db *Database) Events() *Emitter { return db.events }
+
+// AccessController returns the access controller.
+func (db *Database) AccessController() oplog.AccessController { return db.access }
+
+// AddOperation appends op to the log, announces it to peers and emits
+// EventUpdate. It returns the new entry's hash.
+func (db *Database) AddOperation(ctx context.Context, op any) (string, error) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	entry, err := db.log.Append(ctx, op, oplog.AppendOptions{ReferencesCount: db.referencesCount})
+	if err != nil {
+		return "", err
+	}
+	if db.sync != nil {
+		if err := db.sync.Add(ctx, entry); err != nil {
+			// The entry is stored; peers will still get it at the next
+			// heads exchange.
+			db.events.emit(Event{Type: EventError, Err: fmt.Errorf("announce %s: %w", entry.Hash, err)})
+		}
+	}
+	if db.onUpdate != nil {
+		if err := db.onUpdate(ctx, db.log, entry); err != nil {
+			return "", err
+		}
+	}
+	db.events.emit(Event{Type: EventUpdate, Entry: entry})
+	return entry.Hash, nil
+}
+
+// applyOperation joins an entry received from a peer.
+func (db *Database) applyOperation(ctx context.Context, entry *oplog.Entry) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	updated, err := db.log.JoinEntry(ctx, entry)
+	if err != nil {
+		db.events.emit(Event{Type: EventError, Err: err})
+		return
+	}
+	if !updated {
+		return
+	}
+	if db.onUpdate != nil {
+		if err := db.onUpdate(ctx, db.log, entry); err != nil {
+			db.events.emit(Event{Type: EventError, Err: err})
+			return
+		}
+	}
+	db.events.emit(Event{Type: EventUpdate, Entry: entry})
+}
+
+// Close stops syncing, closes the log and its storages and emits
+// EventClose. Closing twice is a no-op.
 func (db *Database) Close() error {
-	close(db.stopChannel)
-	db.Sync.Stop()
-	err := db.Log.Close()
-	if err != nil {
+	db.closeOnce.Do(func() {
+		var errs []error
+		if db.sync != nil {
+			errs = append(errs, db.sync.Stop())
+		}
+		db.mu.Lock()
+		errs = append(errs, db.log.Close())
+		if c, ok := db.access.(interface{ Close() error }); ok {
+			errs = append(errs, c.Close())
+		}
+		db.mu.Unlock()
+		db.closeErr = errors.Join(errs...)
+		db.events.emit(Event{Type: EventClose})
+		db.events.close()
+		if db.onClose != nil {
+			db.onClose()
+		}
+	})
+	return db.closeErr
+}
+
+// Drop removes every entry of the database (locally) and emits EventDrop.
+func (db *Database) Drop(ctx context.Context) error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if err := db.log.Clear(ctx); err != nil {
 		return err
 	}
-	close(db.Events)
-	return nil
-}
-
-// Drop clears the database, removing all entries.
-func (db *Database) Drop() error {
-	// Clear the oplog
-	if err := db.Log.Clear(); err != nil {
-		return fmt.Errorf("failed to clear oplog: %w", err)
-	}
-
-	// Emit a drop event
-	db.Events <- "drop"
-	return nil
-}
-
-// ApplyOperation applies an operation received via synchronization.
-func (db *Database) ApplyOperation(data []byte) {
-	task := func() {
-		// Decode the received data into an entry
-		entry, err := oplog.Decode(data)
-		if err != nil {
-			fmt.Printf("applyOperation: failed to decode data: %v\n", err)
-			return
-		}
-
-		// Ensure entry belongs to the same log
-		if entry.Entry.ID != db.Log.ID {
-			fmt.Printf("applyOperation: log ID mismatch. Entry ID: %s, Log ID: %s\n", entry.Entry.ID, db.Log.ID)
-			return
-		}
-
-		// Join the entry into the log
-		processed := make(map[string]bool)
-
-		// Join the entry into the log
-		if joinErr := db.Log.JoinEntry(&entry, processed); joinErr != nil {
-			fmt.Printf("applyOperation: failed to join entry: %v\n", joinErr)
-			return
-		}
-
-		// Emit the update event safely
-		select {
-		case db.Events <- &entry:
-		default:
-			// Log or handle the case where Events channel is full
-			fmt.Println("applyOperation: Events channel full, event dropped")
+	if d, ok := db.access.(interface{ Drop(context.Context) error }); ok {
+		if err := d.Drop(ctx); err != nil {
+			return err
 		}
 	}
-
-	// Add the task to the queue
-	db.taskQueue <- task
+	db.events.emit(Event{Type: EventDrop})
+	return nil
 }

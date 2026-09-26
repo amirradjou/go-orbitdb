@@ -1,115 +1,123 @@
 package storage
 
 import (
+	"context"
 	"errors"
+	"iter"
 )
 
-// ComposedStorage implements the Storage interface and manages multiple backends.
+// ComposedStorage layers two storages, typically a fast cache (LRU) in front
+// of a durable or remote one (Level, IPFS). Writes go to both; reads try the
+// first and fall back to the second, copying a hit back into the first.
 type ComposedStorage struct {
-	storages []Storage
+	first, second Storage
 }
 
-// NewComposedStorage initializes a ComposedStorage instance with multiple backends.
-func NewComposedStorage(storages ...Storage) (*ComposedStorage, error) {
-	if len(storages) < 2 {
-		return nil, errors.New("at least two storage backends are required")
+// NewComposedStorage composes first (checked first on reads) with second.
+func NewComposedStorage(first, second Storage) *ComposedStorage {
+	return &ComposedStorage{first: first, second: second}
+}
+
+// Put implements Storage.
+func (s *ComposedStorage) Put(ctx context.Context, key string, value []byte) error {
+	if err := s.first.Put(ctx, key, value); err != nil {
+		return err
 	}
-	return &ComposedStorage{storages: storages}, nil
+	return s.second.Put(ctx, key, value)
 }
 
-// Put stores data in all configured storages.
-func (cs *ComposedStorage) Put(key string, value []byte) error {
-	for _, storage := range cs.storages {
-		if err := storage.Put(key, value); err != nil {
-			return err
-		}
+// Get implements Storage.
+func (s *ComposedStorage) Get(ctx context.Context, key string) ([]byte, error) {
+	value, err := s.first.Get(ctx, key)
+	if err == nil {
+		return value, nil
 	}
-	return nil
-}
-
-// Get retrieves data from the first storage that has the key.
-// If the key is found in a fallback storage, it is propagated to the earlier storages.
-func (cs *ComposedStorage) Get(key string) ([]byte, error) {
-	for i, storage := range cs.storages {
-		value, err := storage.Get(key)
-		if err == nil {
-			// Propagate to earlier storages if retrieved from a fallback storage.
-			for j := 0; j < i; j++ {
-				_ = cs.storages[j].Put(key, value) // Ignore errors during propagation.
-			}
-			return value, nil
-		}
+	if !errors.Is(err, ErrNotFound) {
+		return nil, err
 	}
-	return nil, errors.New("key not found")
-}
-
-// Delete removes data from all storages.
-func (cs *ComposedStorage) Delete(key string) error {
-	for _, storage := range cs.storages {
-		if err := storage.Delete(key); err != nil {
-			return err
-		}
+	value, err = s.second.Get(ctx, key)
+	if err != nil {
+		return nil, err
 	}
-	return nil
+	if err := s.first.Put(ctx, key, value); err != nil {
+		return nil, err
+	}
+	return value, nil
 }
 
-// Iterator combines iterators from all storages, ensuring unique keys.
-func (cs *ComposedStorage) Iterator() (<-chan [2]string, error) {
-	ch := make(chan [2]string)
-	seen := make(map[string]bool)
+// Del implements Storage.
+func (s *ComposedStorage) Del(ctx context.Context, key string) error {
+	if err := s.first.Del(ctx, key); err != nil {
+		return err
+	}
+	return s.second.Del(ctx, key)
+}
 
-	go func() {
-		defer close(ch)
-		for _, storage := range cs.storages {
-			iter, err := storage.Iterator()
-			if err != nil {
-				continue // Skip problematic storage during iteration.
-			}
-
-			for kv := range iter {
-				if !seen[kv[0]] {
-					seen[kv[0]] = true
-					ch <- kv
+// Iterator implements Storage. It yields the pairs of the first storage and
+// then those of the second whose keys have not been seen yet. opts is passed
+// to both, so Amount bounds each storage separately, as in @orbitdb/core.
+func (s *ComposedStorage) Iterator(ctx context.Context, opts IteratorOptions) iter.Seq2[Pair, error] {
+	return func(yield func(Pair, error) bool) {
+		seen := make(map[string]struct{})
+		for _, st := range []Storage{s.first, s.second} {
+			for p, err := range st.Iterator(ctx, opts) {
+				if err != nil {
+					yield(Pair{}, err)
+					return
+				}
+				if _, dup := seen[p.Key]; dup {
+					continue
+				}
+				seen[p.Key] = struct{}{}
+				if !yield(p, nil) {
+					return
 				}
 			}
 		}
-	}()
-
-	return ch, nil
+	}
 }
 
-// Merge merges data from another storage into all composed storages.
-func (cs *ComposedStorage) Merge(other Storage) error {
-	iter, err := other.Iterator()
-	if err != nil {
+// Merge implements Storage. Like @orbitdb/core it merges in both directions:
+// afterwards this storage and other each hold the union of both.
+func (s *ComposedStorage) Merge(ctx context.Context, other Storage) error {
+	if other == nil {
+		return nil
+	}
+	for _, step := range []func() error{
+		func() error { return s.first.Merge(ctx, other) },
+		func() error { return s.second.Merge(ctx, other) },
+		func() error { return other.Merge(ctx, s.first) },
+		func() error { return other.Merge(ctx, s.second) },
+	} {
+		if err := step(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Persist implements Persister by persisting key in whichever layers
+// support it.
+func (s *ComposedStorage) Persist(ctx context.Context, key string) error {
+	for _, st := range []Storage{s.first, s.second} {
+		if p, ok := st.(Persister); ok {
+			if err := p.Persist(ctx, key); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// Clear implements Storage.
+func (s *ComposedStorage) Clear(ctx context.Context) error {
+	if err := s.first.Clear(ctx); err != nil {
 		return err
 	}
-
-	for kv := range iter {
-		if err := cs.Put(kv[0], []byte(kv[1])); err != nil {
-			return err
-		}
-	}
-
-	return nil
+	return s.second.Clear(ctx)
 }
 
-// Clear removes all data from all storages.
-func (cs *ComposedStorage) Clear() error {
-	for _, storage := range cs.storages {
-		if err := storage.Clear(); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// Close closes all storage backends.
-func (cs *ComposedStorage) Close() error {
-	for _, storage := range cs.storages {
-		if err := storage.Close(); err != nil {
-			return err
-		}
-	}
-	return nil
+// Close implements Storage. Both layers are closed even if the first fails.
+func (s *ComposedStorage) Close() error {
+	return errors.Join(s.first.Close(), s.second.Close())
 }
